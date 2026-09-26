@@ -33,6 +33,7 @@ class PaginatedPage:
 
 class TalosAPIClient:
     def __init__(self, settings: Settings):
+        self._settings = settings
         self._base = settings.talos_api_url.rstrip("/")
         self._talos_id = settings.talos_id
         self._client = httpx.AsyncClient(
@@ -49,6 +50,13 @@ class TalosAPIClient:
         headers = {"Authorization": f"Bearer {self._settings.secret_value('talos_api_key')}"}
         headers.update(supplied or {})
         return headers
+
+    @property
+    def _a2a_timeout(self) -> httpx.Timeout:
+        """Per-request timeout for A2A (Agent-to-Agent) composition calls."""
+        return httpx.Timeout(
+            connect=self._settings.a2a_connect_timeout,
+            read=self._settings.a2a_read_timeout,
 
     # ── Retry-wrapped, traced HTTP verbs ──────────────────
 
@@ -392,7 +400,7 @@ class TalosAPIClient:
         params = {}
         if service_type:
             params["type"] = service_type
-        return await self._get(f"/api/talos/{talos_id}/service", params=params)
+        return await self._get(f"/api/talos/{talos_id}/service", params=params, timeout=self._a2a_timeout)
 
     async def submit_commerce(
         self,
@@ -408,6 +416,7 @@ class TalosAPIClient:
             json={"payload": payload},
             headers={"X-PAYMENT": payment_header},
             idempotency_key=idempotency_key,
+            timeout=self._a2a_timeout,
         )
         if r.status_code in (200, 201):
             return r.json()
@@ -523,7 +532,7 @@ class TalosAPIClient:
     # ── Jobs ───────────────────────────────────────────────
 
     async def get_pending_jobs(self) -> list[dict]:
-        r = await self._get("/api/jobs/pending")
+        r = await self._get("/api/jobs/pending", timeout=self._a2a_timeout)
         if r.status_code == 200:
             data = r.json()
             return data if isinstance(data, list) else data.get("jobs", [])
@@ -535,6 +544,7 @@ class TalosAPIClient:
         r = await self._post(
             f"/api/jobs/{job_id}/claim",
             json={"ttlSeconds": ttl_seconds},
+            timeout=self._a2a_timeout,
         )
         if r.status_code == 200:
             return r.json()
@@ -545,6 +555,7 @@ class TalosAPIClient:
         r = await self._post(
             f"/api/jobs/{job_id}/heartbeat",
             json={"fencingToken": fencing_token},
+            timeout=self._a2a_timeout,
         )
         if r.status_code == 200:
             return r.json()
@@ -573,6 +584,7 @@ class TalosAPIClient:
             f"/api/jobs/{job_id}/result",
             json={"result": result, "fencingToken": fencing_token},
             headers=headers,
+            timeout=self._a2a_timeout,
         )
         if r.status_code in (200, 201):
             return r.json()

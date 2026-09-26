@@ -349,6 +349,12 @@ class Settings(BaseSettings):
     talos_job_effect_dispatch_timeout_seconds: int = Field(default=20, ge=1, le=120)
     talos_job_effect_db_timeout_ms: int = Field(default=5_000, ge=1, le=30_000)
 
+    # A2A (Agent-to-Agent) composition timeouts
+    a2a_connect_timeout: float = Field(default=10.0, description="Seconds to wait for A2A TCP connect")
+    a2a_read_timeout: float = Field(default=30.0, description="Seconds to wait for A2A response body")
+    a2a_write_timeout: float = Field(default=10.0, description="Seconds to wait to send A2A request body")
+    a2a_pool_timeout: float = Field(default=5.0, description="Seconds to wait for A2A connection from pool")
+
     # Graceful shutdown (#182)
     shutdown_deadline: float = Field(
         default=30.0,
