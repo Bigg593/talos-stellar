@@ -8,12 +8,12 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
+from opentelemetry.trace import SpanKind
 
 from talos_agent import metrics
 from talos_agent.config import Settings
 from talos_agent.http import RetryableHTTPError, request_with_retry
 from talos_agent.tracing import inject_trace_headers, traced_span
-from opentelemetry.trace import SpanKind
 
 _NO_KEY = object()
 _MAX_PAGINATION_PAGES = 1_000
@@ -668,3 +668,20 @@ class TalosAPIClient:
     def set_request_id(self, request_id: str) -> None:
         """Propagate cycle_id as X-Request-Id to web API calls."""
         self._client.headers["x-request-id"] = request_id
+
+    # ── A2A Timeout ────────────────────────────────────────
+
+    @property
+    def _a2a_timeout(self) -> httpx.Timeout:
+        """Build an httpx.Timeout from the four A2A timeout settings.
+
+        Returns a fresh Timeout each call so callers always get a value that
+        reflects the current settings, and the property remains free of
+        mutable cached state.
+        """
+        return httpx.Timeout(
+            connect=self._settings.a2a_connect_timeout,
+            read=self._settings.a2a_read_timeout,
+            write=self._settings.a2a_write_timeout,
+            pool=self._settings.a2a_pool_timeout,
+        )
