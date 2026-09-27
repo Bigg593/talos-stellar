@@ -51,13 +51,6 @@ class TalosAPIClient:
         headers.update(supplied or {})
         return headers
 
-    @property
-    def _a2a_timeout(self) -> httpx.Timeout:
-        """Per-request timeout for A2A (Agent-to-Agent) composition calls."""
-        return httpx.Timeout(
-            connect=self._settings.a2a_connect_timeout,
-            read=self._settings.a2a_read_timeout,
-
     # ── Retry-wrapped, traced HTTP verbs ──────────────────
 
     async def _request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
