@@ -446,7 +446,7 @@ class TalosAPIClient:
         params = {}
         if service_type:
             params["type"] = service_type
-        return await self._get(f"/api/talos/{talos_id}/service", params=params)
+        return await self._get(f"/api/talos/{talos_id}/service", params=params, timeout=self._a2a_timeout)
 
     async def submit_commerce(
         self,
@@ -462,6 +462,7 @@ class TalosAPIClient:
             json={"payload": payload},
             headers={"X-PAYMENT": payment_header},
             idempotency_key=idempotency_key,
+            timeout=self._a2a_timeout,
         )
         if r.status_code in (200, 201):
             return r.json()
@@ -577,7 +578,7 @@ class TalosAPIClient:
     # ── Jobs ───────────────────────────────────────────────
 
     async def get_pending_jobs(self) -> list[dict]:
-        r = await self._get("/api/jobs/pending")
+        r = await self._get("/api/jobs/pending", timeout=self._a2a_timeout)
         if r.status_code == 200:
             data = r.json()
             return data if isinstance(data, list) else data.get("jobs", [])
@@ -589,6 +590,7 @@ class TalosAPIClient:
         r = await self._post(
             f"/api/jobs/{job_id}/claim",
             json={"ttlSeconds": ttl_seconds},
+            timeout=self._a2a_timeout,
         )
         if r.status_code == 200:
             return r.json()
@@ -599,6 +601,7 @@ class TalosAPIClient:
         r = await self._post(
             f"/api/jobs/{job_id}/heartbeat",
             json={"fencingToken": fencing_token},
+            timeout=self._a2a_timeout,
         )
         if r.status_code == 200:
             return r.json()
@@ -627,6 +630,7 @@ class TalosAPIClient:
             f"/api/jobs/{job_id}/result",
             json={"result": result, "fencingToken": fencing_token},
             headers=headers,
+            timeout=self._a2a_timeout,
         )
         if r.status_code in (200, 201):
             return r.json()
@@ -710,3 +714,20 @@ class TalosAPIClient:
     def set_request_id(self, request_id: str) -> None:
         """Propagate cycle_id as X-Request-Id to web API calls."""
         self._client.headers["x-request-id"] = request_id
+
+    # ── A2A Timeout ────────────────────────────────────────
+
+    @property
+    def _a2a_timeout(self) -> httpx.Timeout:
+        """Build an httpx.Timeout from the four A2A timeout settings.
+
+        Returns a fresh Timeout each call so callers always get a value that
+        reflects the current settings, and the property remains free of
+        mutable cached state.
+        """
+        return httpx.Timeout(
+            connect=self._settings.a2a_connect_timeout,
+            read=self._settings.a2a_read_timeout,
+            write=self._settings.a2a_write_timeout,
+            pool=self._settings.a2a_pool_timeout,
+        )
