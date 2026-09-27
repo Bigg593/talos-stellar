@@ -72,7 +72,6 @@ class PaginatedPage:
 
 class TalosAPIClient:
     def __init__(self, settings: Settings):
-        self._settings = settings
         self._base = settings.talos_api_url.rstrip("/")
         self._talos_id = settings.talos_id
         self._client = httpx.AsyncClient(
