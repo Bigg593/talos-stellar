@@ -4,23 +4,33 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from talos_agent.db import normalize_playbook_name
+from talos_agent.observability import log
 from talos_agent.payments import USDC_TESTNET_ISSUER
 from talos_agent.payments.x402_signer import X402Signer
+from talos_agent.commerce_quote import (
+    DEFAULT_X402_CLOCK_SKEW_POLICY,
+    enforce_commerce_quote_expiry,
+    quote_expiry_iso,
+)
 from talos_agent.tools.registry import tool
 
 if TYPE_CHECKING:
     from talos_agent.api_client import TalosAPIClient
     from talos_agent.config import Settings
     from talos_agent.db import LocalDB
+    from talos_agent.job_effects import JobEffectDispatcher, JobEffectStore
 
 # Injected by registry.build_all_tools
 _api: TalosAPIClient = None  # type: ignore[assignment]
 _db: LocalDB = None  # type: ignore[assignment]
 _settings: Settings = None  # type: ignore[assignment]
 _signer: X402Signer | None = None
+_job_effect_store: JobEffectStore | None = None
+_job_effect_dispatcher: JobEffectDispatcher | None = None
 
 ALL_CATEGORIES = [
     "Sales", "Marketing", "Analytics", "Development", "Research",
@@ -94,8 +104,41 @@ async def purchase_service(talos_id: str, service_type: str = "", payload: str =
 
     # Parse 402 response
     payment_details = response.json()
+    if not isinstance(payment_details, dict):
+        return {
+            "error": "Malformed 402 payment details",
+            "code": "INVALID_QUOTE",
+        }
+
+    # Fail closed on expired / malformed commerce quotes before any signing.
+    # Nested quote.expiresAt (A2A) is preferred; top-level expiresAt accepted.
+    # Legacy price/payee-only 402s without expiry remain allowed (require_expiry=False)
+    # unless a quote object is present — then expiry is mandatory.
+    #
+    # expiresAt is stamped by the issuer's clock while this check runs on ours,
+    # so the comparison carries the bounded x402 clock-skew policy: the
+    # settlement margin stops us spending a nonce on a quote that would expire
+    # between signing and settlement.
+    quote_obj = payment_details.get("quote")
+    expiry_error = enforce_commerce_quote_expiry(
+        payment_details,
+        require_expiry=isinstance(quote_obj, dict),
+        policy=DEFAULT_X402_CLOCK_SKEW_POLICY,
+    )
+    if expiry_error is not None:
+        return expiry_error
+
     price = payment_details.get("price", 0)
     payee = payment_details.get("payee", "")
+    # Prefer quote.amount when present (canonical A2A decimal) for display/budget.
+    if isinstance(quote_obj, dict) and quote_obj.get("amount") is not None:
+        try:
+            price = float(quote_obj["amount"])
+        except (TypeError, ValueError):
+            return {
+                "error": "Commerce quote amount is malformed",
+                "code": "INVALID_QUOTE",
+            }
     # Check if purchase would exceed GTM budget
     if spent_month + float(price) > gtm_budget:
         return {
@@ -138,7 +181,6 @@ async def purchase_service(talos_id: str, service_type: str = "", payload: str =
         asset_issuer=USDC_TESTNET_ISSUER,
     )
 
-
     if "error" in sign_result:
         return sign_result
 
@@ -158,8 +200,12 @@ async def purchase_service(talos_id: str, service_type: str = "", payload: str =
 
     job_id = submit_result.get("jobId") or submit_result.get("id", "")
 
-    # Track in local DB
-    _db.add_commerce_job(job_id, talos_id, service_type, payload_dict)
+    # Track in local DB (persist quote expiry in payload for durable audit / restart safety)
+    tracked_payload = dict(payload_dict) if isinstance(payload_dict, dict) else {}
+    expiry_iso = quote_expiry_iso(payment_details)
+    if expiry_iso:
+        tracked_payload.setdefault("_quote_expires_at", expiry_iso)
+    _db.add_commerce_job(job_id, talos_id, service_type, tracked_payload)
 
     # Record spending against GTM budget
     _db.record_spending(
@@ -248,6 +294,9 @@ async def apply_playbook(playbook_name: str) -> dict:
 
 # In-memory store of claimed job fencing tokens, keyed by job_id.
 # Used by claim_job / fulfill_job and the background heartbeat task.
+# IMPORTANT: This is always the authoritative in-memory view, but it is
+# backed by the ``claimed_jobs`` table in SQLite so tokens survive restarts.
+# reconcile_after_restore() repopulates this dict from the DB at startup.
 _claimed_jobs: dict[str, int] = {}
 _claimed_jobs_lock: asyncio.Lock | None = None
 
@@ -263,14 +312,103 @@ def get_claimed_jobs_copy() -> dict[str, int]:
     return dict(_claimed_jobs)
 
 
-async def set_claimed_job(job_id: str, fencing_token: int) -> None:
+async def set_claimed_job(
+    job_id: str,
+    fencing_token: int,
+    *,
+    ttl_seconds: int = 300,
+    lease_expires_at: datetime | None = None,
+) -> None:
+    """Record a job claim in memory *and* persist it to SQLite.
+
+    Parameters
+    ----------
+    job_id:
+        Unique job identifier.
+    fencing_token:
+        Server-issued monotonic token; guards against stale fulfillments.
+    ttl_seconds:
+        Lease duration in seconds (default 300).
+    lease_expires_at:
+        Optional server-reported expiry; used for accurate pruning on restore.
+    """
     async with _get_claimed_jobs_lock():
         _claimed_jobs[job_id] = fencing_token
+        if _db is not None:
+            try:
+                _db.upsert_claimed_job(
+                    job_id,
+                    fencing_token,
+                    ttl_seconds=ttl_seconds,
+                    lease_expires_at=lease_expires_at,
+                )
+            except Exception as _exc:  # pragma: no cover  # noqa: BLE001
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "set_claimed_job: failed to persist fencing token for %s: %s",
+                    job_id,
+                    _exc,
+                )
 
 
 async def remove_claimed_job(job_id: str) -> None:
+    """Remove a job claim from memory *and* from the DB."""
     async with _get_claimed_jobs_lock():
         _claimed_jobs.pop(job_id, None)
+        if _db is not None:
+            try:
+                _db.delete_claimed_job(job_id)
+            except Exception as _exc:  # pragma: no cover  # noqa: BLE001
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "remove_claimed_job: failed to delete DB record for %s: %s",
+                    job_id,
+                    _exc,
+                )
+
+
+async def release_claimed_jobs() -> tuple[int, int]:
+    """Release all locally persisted remote job leases.
+
+    Returns ``(released, failed)``. Failed releases remain persisted so the
+    normal restore reconciliation can retry/verify ownership on the next run.
+    Only aggregate counts are logged to avoid exposing job payloads or proofs.
+    """
+    if _api is None or _db is None:
+        return 0, 0
+
+    try:
+        claims = _db.get_all_claimed_jobs()
+    except Exception as exc:  # pragma: no cover - defensive shutdown path
+        log.warning("job_shutdown_claim_read_failed", error_type=type(exc).__name__)
+        return 0, 1
+
+    released = 0
+    failed = 0
+    for claim in claims:
+        try:
+            response = await _api.release_job(
+                claim["job_id"],
+                claim["fencing_token"],
+            )
+            if response:
+                await remove_claimed_job(claim["job_id"])
+                released += 1
+            else:
+                failed += 1
+        except Exception as exc:  # pragma: no cover - defensive shutdown path
+            failed += 1
+            log.warning(
+                "job_shutdown_claim_release_failed",
+                error_type=type(exc).__name__,
+            )
+
+    log.info(
+        "job_shutdown_claim_release_complete",
+        released=released,
+        failed=failed,
+    )
+    return released, failed
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -283,6 +421,26 @@ async def remove_claimed_job(job_id: str) -> None:
     "Check for incoming x402 service requests that Other Taloses have purchased from us. Returns pending jobs available to fulfill.",
 )
 async def get_pending_jobs() -> dict:
+    if _job_effect_store is not None:
+        try:
+            jobs = await _api.get_pending_jobs()
+        except Exception:
+            jobs = []
+        for job in jobs:
+            try:
+                _job_effect_store.ingest(job)
+            except Exception as exc:
+                from talos_agent.job_effects import JobEffectError
+
+                if isinstance(exc, JobEffectError):
+                    log.warning("job_inbox_rejected", error_code=exc.code)
+                    continue
+                raise
+        durable_jobs = _job_effect_store.pending_jobs()
+        if not durable_jobs:
+            return {"status": "no_pending_jobs", "count": 0}
+        return {"jobs": durable_jobs, "count": len(durable_jobs)}
+
     jobs = await _api.get_pending_jobs()
     if not jobs:
         return {"status": "no_pending_jobs", "count": 0}
@@ -307,12 +465,39 @@ async def get_pending_jobs() -> dict:
     "Call this before working on a job, then call fulfill_job with the result.",
 )
 async def claim_job(job_id: str, ttl_seconds: int = 300) -> dict:
+    if _job_effect_store is not None:
+        if (
+            not isinstance(ttl_seconds, int)
+            or isinstance(ttl_seconds, bool)
+            or ttl_seconds < 1
+            or ttl_seconds > 600
+        ):
+            return {"error": "validation_error"}
+        # A direct claim may race ahead of polling. Refreshing the durable inbox
+        # first preserves the invariant that remote leases always have a local
+        # owner and payload record.
+        await get_pending_jobs()
     result = await _api.claim_job(job_id, ttl_seconds=ttl_seconds)
     if not result:
         return {"error": f"Failed to claim job {job_id} — it may be leased by another worker"}
     fencing_token = result.get("fencingToken")
     if fencing_token is not None:
-        await set_claimed_job(job_id, fencing_token)
+        # Parse server-reported expiry for accurate lease tracking
+        expires_raw = result.get("leaseExpiresAt")
+        lease_expires_at: datetime | None = None
+        if expires_raw:
+            try:
+                lease_expires_at = datetime.fromisoformat(
+                    expires_raw.replace("Z", "+00:00")
+                )
+            except (ValueError, AttributeError):
+                lease_expires_at = None
+        await set_claimed_job(
+            job_id,
+            fencing_token,
+            ttl_seconds=ttl_seconds,
+            lease_expires_at=lease_expires_at,
+        )
     return {
         "status": "claimed",
         "job_id": job_id,
@@ -332,6 +517,36 @@ async def fulfill_job(job_id: str, result: str = "{}") -> dict:
         result_dict = json.loads(result)
     except json.JSONDecodeError:
         result_dict = {"text": result}
+
+    if _job_effect_store is not None and _job_effect_dispatcher is not None:
+        try:
+            effect_id = _job_effect_store.prepare_effect(job_id, result_dict)
+            await _job_effect_dispatcher.dispatch_once()
+            effect = _job_effect_store.effect_status(effect_id)
+        except Exception as exc:
+            from talos_agent.job_effects import JobEffectError
+
+            if isinstance(exc, JobEffectError):
+                return {"error": exc.code, "job_id": job_id}
+            raise
+        if effect["state"] == "succeeded":
+            return {
+                "status": "fulfilled",
+                "job_id": job_id,
+                "effect_id": effect_id,
+            }
+        if effect["state"] == "conflict":
+            return {
+                "error": "remote_result_conflict",
+                "job_id": job_id,
+                "effect_id": effect_id,
+            }
+        return {
+            "status": "queued",
+            "job_id": job_id,
+            "effect_id": effect_id,
+            "effect_state": effect["state"],
+        }
 
     fencing_token = _claimed_jobs.get(job_id, 0)
     response = await _api.submit_job_result(job_id, result_dict, fencing_token=fencing_token)

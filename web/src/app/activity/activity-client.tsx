@@ -2,6 +2,10 @@
 
 import { useState, useMemo, useEffect, useCallback } from "react";
 import { AgentAvatar } from "@/components/agent-avatar";
+import {
+  mergeBackgroundRefresh,
+  shouldReplaceRowsOnRefresh,
+} from "@/lib/preserveDashboardState";
 
 // ─── Types ───────────────────────────────────────────────────────
 
@@ -92,20 +96,38 @@ export function ActivityClient({ stats: initialStats, transactions: initialTrans
   // Poll stats + transactions (first page only)
   const refresh = useCallback(async () => {
     try {
-      const isFirstPage = page === 1;
+      const replaceRows = shouldReplaceRowsOnRefresh(page, loading);
       const params = new URLSearchParams(
-        isFirstPage ? { limit: String(PAGE_SIZE) } : { statsOnly: "true" }
+        replaceRows ? { limit: String(PAGE_SIZE) } : { statsOnly: "true" }
       );
       const res = await fetch(`/api/activity?${params}`);
       if (!res.ok) return;
       const data = await res.json();
-      setStats(data.stats);
-      if (isFirstPage) {
-        setTransactions(data.transactions);
-        setNextCursor(data.nextCursor);
+      // Merge through the preserve helper so filter / page / selection stay put.
+      const merged = mergeBackgroundRefresh(
+        {
+          stats,
+          rows: transactions,
+          filter,
+          page,
+          nextCursor,
+          prevCursors,
+          loading,
+        },
+        {
+          stats: data.stats,
+          rows: data.transactions,
+          nextCursor: data.nextCursor,
+        },
+        { replaceRows },
+      );
+      setStats(merged.stats);
+      if (replaceRows) {
+        setTransactions(merged.rows);
+        setNextCursor(merged.nextCursor);
       }
     } catch { /* silent */ }
-  }, [page]);
+  }, [page, loading, stats, transactions, filter, nextCursor, prevCursors]);
 
   useEffect(() => {
     const id = setInterval(refresh, POLL_INTERVAL);
@@ -156,7 +178,7 @@ export function ActivityClient({ stats: initialStats, transactions: initialTrans
     <div className="max-w-7xl mx-auto px-4 sm:px-6 py-6 sm:py-12">
       {/* Header */}
       <div className="mb-10">
-        <div className="text-sm text-muted mb-2 tracking-wide">// AGENT ECONOMY</div>
+        <div className="text-sm text-muted mb-2 tracking-wide">{/* AGENT ECONOMY */}</div>
         <h1 className="text-2xl font-bold text-accent tracking-tight">
           Activity
         </h1>
@@ -211,7 +233,7 @@ export function ActivityClient({ stats: initialStats, transactions: initialTrans
       <section className="mb-10">
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-sm text-muted tracking-wide">
-            // TRANSACTION FEED
+            {/* TRANSACTION FEED */}
           </h2>
           <div className="flex border border-border">
             {FILTERS.map((f) => (

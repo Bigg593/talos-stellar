@@ -2,22 +2,35 @@
 
 Stellar-based smart contracts for the Talos Protocol, built with Rust and the Soroban SDK.
 
+See [EVENTS.md](./EVENTS.md) for the full contract event indexing specification.
+
 ## Contracts
 
 ### 1. TalosRegistry
+
 - **Purpose**: Creates and manages Talos entities on-chain
 - **Features**:
   - Talos creation with metadata (name, category, description)
   - Patron configuration (creator/investor/treasury shares)
   - Kernel policy management (approval thresholds, GTM budget)
   - Pulse token metadata storage
+  - **Metadata byte limits** (`create_talos`/`update_pulse` reject `name` > 64, `category` > 32, `description` > 512, `Pulse.token_symbol` > 12 bytes; `name` and `token_symbol` must be non-empty)
   - 3% protocol fee to protocol wallet on creation
   - **Two-step admin transfer** (`propose_admin` / `accept_admin` / `cancel_admin_transfer`)
   - **Admin timelocks** (`schedule_action` / `execute_action` / `cancel_action` / `set_timelock_config`)
+  - **Separated pause-control roles**: Creator can set dedicated pause and resume controllers for safe delegation
+  - Pause controller can deactivate Talos, resume controller can activate Talos
+  - Creator retains full pause/resume capabilities regardless of controller settings
+  - Enables operators and contributors to safely manage Talos lifecycle without creator intervention
   - **Interface version query** (`version()` — immutable, compile-time constant `(1, 1, 0)`)
-  - Events: `tls_crt`, `pat_upd`, `fee_chg`, `adm_prp`, `adm_acc`, `adm_cnl`, `tl_sch`, `tl_exec`, `tl_cnl`, `tl_cfg`
+  - **Stable interface identifier** (`interface_id()` returns `BytesN<32>` derived from `"TalosRegistry"` + version)
+  - **Version negotiation** (`supports_version(maj, min, patch)`)
+  - **Capability catalogue** (`interface_features()` returns `Vec<Symbol>`)
+  - **Deprecation telemetry** (`dep_path` event emitted before panic when timelock is enabled)
+  - Events: `tls_crt`, `tls_crt2`, `pat_upd`, `fee_chg`, `adm_prp`, `adm_acc`, `adm_cnl`, `tl_sch`, `tl_exec`, `tl_cnl`, `tl_cfg`, `dep_path`, `tls_paus`, `tls_resu`
 
 ### 2. TalosNameService
+
 - **Purpose**: Human-readable name registration for Talos IDs
 - **Features**:
   - Name → Talos ID mapping (e.g., "marketbot" → 42)
@@ -25,7 +38,12 @@ Stellar-based smart contracts for the Talos Protocol, built with Rust and the So
   - Admin-controlled registry contract pointer (`set_registry_contract`)
   - **Admin timelocks** (`schedule_action` / `execute_action` / `cancel_action` / `set_timelock_config`)
   - **Interface version query** (`version()` — immutable, compile-time constant `(1, 1, 0)`)
-  - Events: `name_reg`, `tl_sch`, `tl_exec`, `tl_cnl`, `tl_cfg`
+  - **Stable interface identifier** (`interface_id()` returns `BytesN<32>` derived from `"TalosNameService"` + version)
+  - **Version negotiation** (`supports_version(maj, min, patch)`)
+  - **Capability catalogue** (`interface_features()` returns `Vec<Symbol>`)
+  - **Cross-contract compatibility** (`assert_registry_compatible()` cross-invokes Registry's `interface_id` + `version`)
+  - **Deprecation telemetry** (`dep_path` event emitted before panic when timelock is enabled)
+  - Events: `name_reg`, `name_reg2`, `tl_sch`, `tl_exec`, `tl_cnl`, `tl_cfg`, `dep_path`, `compat_ok`, `compat_err`
 
 ### 3. TalosGovernance
 - **Purpose**: Token-weighted governance for Talos Protocol
@@ -35,7 +53,27 @@ Stellar-based smart contracts for the Talos Protocol, built with Rust and the So
   - Snapshot-based vote weight calculation (balances at proposal creation)
   - Quorum and consensus-based proposal approval/rejection
   - Configurable voting periods and thresholds
+  - **Interface version query** (`version()` — immutable, compile-time constant `(1, 0, 0)`)
+  - **Stable interface identifier** (`interface_id()` returns `BytesN<32>` derived from `"TalosGovernance"` + version)
+  - **Version negotiation** (`supports_version(maj, min, patch)`)
+  - **Capability catalogue** (`interface_features()` returns `Vec<Symbol>`)
   - Events: `proposal_created`, `vote_cast`, `proposal_status_changed`
+  - **Scoped emergency pause controls** (`pause_domain` / `unpause_domain` / `is_domain_paused`) with domain-scoped pausing, auto-expiration, and event emission
+
+All three contracts include scoped emergency pause controls with domain-based pause/unpause, auto-expiration, and event emission.
+
+## Event Schema Compatibility
+
+Both contracts expose a pure-read `event_schema_version()` entry point that
+returns a typed `{ major, minor }` value. The current canonical version is
+`{ major: 1, minor: 0 }`.
+
+Indexers should call this helper during startup and reject or quarantine a
+deployment whose `major` version they do not support. A major-version change
+indicates a breaking event payload change; minor versions are reserved for
+backwards-compatible additions.
+
+The helper does not alter event names, topics, data fields, or field order.
 
 ## Prerequisites
 
@@ -230,6 +268,33 @@ stellar contract invoke \
   --grace_period 604800
 ```
 
+### Step 6.1: (Optional) Verify Interface Compatibility
+
+Every Talos contract exposes a stable interface identifier and a
+SemVer-style version query. Tools (SDKs, off-chain indexers, dependent
+contracts) should call these before invoking any mutating entry-point.
+See [`INTERFACE.md`](INTERFACE.md) for the full specification.
+
+```bash
+# TalosRegistry — verify version and interface id
+stellar contract invoke --id "$REGISTRY_CONTRACT" --network testnet -- version
+# Expected: [1, 1, 0]
+stellar contract invoke --id "$REGISTRY_CONTRACT" --network testnet -- supports_version \
+  --major 1 --minor 1 --patch 0
+# Expected: true
+stellar contract invoke --id "$REGISTRY_CONTRACT" --network testnet -- interface_features
+# Expected: ["create_talos", "talos_lifecycle", "admin_transfer",
+#           "timelock_admin", "protocol_fee", "interface_query", "fees_collector"]
+
+# TalosNameService — assert registry compatibility via cross-contract check
+stellar contract invoke --id "$NAME_SERVICE_CONTRACT" --network testnet -- assert_registry_compatible
+# Emits `compat_ok` event with the registry's version tuple on success.
+
+# TalosGovernance — verify version
+stellar contract invoke --id "$GOVERNANCE_CONTRACT" --network testnet -- version
+# Expected: [1, 0, 0]
+```
+
 ### Environment Variables Reference
 
 | Variable | Format | Purpose | Example |
@@ -266,6 +331,9 @@ stellar contract invoke \
 | "Timelock enabled: action must be scheduled" | min_delay > 0 | Use `schedule_action` then `execute_action` |
 | "Timelock delay not met" | Executed before ETA | Wait for `eta` ledger timestamp |
 | "Proposal expired" | Executed after grace window | Re-schedule; old proposal is permanently expired |
+| "Domain is paused" / `ContractError::DomainPaused` | A guardian or the admin paused that write path | Wait for the pause to expire, or have the admin call `unpause` |
+| "Caller is not admin or guardian" | Non-authorized address called `pause` | Have the admin add the caller via `add_guardian`, or use the admin key |
+| "Domain locked by admin; guardians cannot modify" | A guardian tried to override an admin-set pause | Only the admin can change or lift it — call `unpause` with the admin key |
 
 ## Invoke Examples
 
@@ -312,14 +380,26 @@ soroban contract invoke \
 contracts/
 ├── Cargo.toml                      # Workspace config
 ├── soroban-config.toml             # Soroban deployment config
+├── pause_control/
+│   ├── Cargo.toml
+│   └── src/
+│       └── lib.rs                  # Emergency pause control library
 ├── talos_registry/
 │   ├── Cargo.toml
 │   └── src/
 │       └── lib.rs                  # TalosRegistry contract
-└── talos_name_service/
+├── talos_name_service/
+│   ├── Cargo.toml
+│   └── src/
+│       └── lib.rs                  # TalosNameService contract
+├── talos_governance/
+│   ├── Cargo.toml
+│   └── src/
+│       └── lib.rs                  # TalosGovernance contract
+└── ttl_manager/
     ├── Cargo.toml
     └── src/
-        └── lib.rs                  # TalosNameService contract
+        └── lib.rs                  # Storage TTL management library
 ```
 
 ## Event Schema
@@ -331,6 +411,7 @@ Both contracts emit typed Soroban events on every meaningful state change. Off-c
 | Event | Topics | Data | Emitted on |
 |-------|--------|------|-----------| 
 | `tls_crt` | `(symbol_short!("tls_crt"), creator: Address)` | `(talos_id: u32, name: String, category: String)` | `create_talos` success |
+| `tls_crt2` | `(symbol_short!("tls_crt2"), creator: Address)` | `(version: u32, talos_id: u32, name: String, category: String)` | `create_talos` success (v2) |
 | `pat_upd` | `(symbol_short!("pat_upd"), talos_id: u32)` | `(creator: Address, creator_share: u32, investor_share: u32)` | `update_patron` success |
 | `fee_chg` | `(symbol_short!("fee_chg"),)` | `(old_bps: u32, new_bps: u32)` | `set_protocol_fee` or timelock execution |
 | `adm_prp` | `(symbol_short!("adm_prp"),)` | `(current: Address, proposed: Address)` | `propose_admin` or timelock execution |
@@ -340,6 +421,11 @@ Both contracts emit typed Soroban events on every meaningful state change. Off-c
 | `tl_exec` | `(symbol_short!("tl_exec"), proposal_id: u64)` | `(action: AdminAction, executor: Address)` | `execute_action` success |
 | `tl_cnl`  | `(symbol_short!("tl_cnl"), proposal_id: u64)` | `(action: AdminAction, canceller: Address)` | `cancel_action` success |
 | `tl_cfg`  | `(symbol_short!("tl_cfg"),)` | `(old_min_delay: u64, new_min_delay: u64, grace_period: u64)` | `set_timelock_config` success |
+| `dom_paus`| `(symbol_short!("dom_paus"), by: Address)` | `(domain_id: u32, duration: u64)` | `pause_domain` success |
+| `dom_resm`| `(symbol_short!("dom_resm"), by: Address)` | `(domain_id: u32,)` | `unpause_domain` success |
+| `dom_expd`| `(symbol_short!("dom_expd"),)` | `(domain_id: u32,)` | Auto-expiry after duration elapses |
+| `tls_paus` | `(symbol_short!("tls_paus"), talos_id: u32)` | `(controller: Address)` | `deactivate_talos` success |
+| `tls_resu` | `(symbol_short!("tls_resu"), talos_id: u32)` | `(controller: Address)` | `activate_talos` success |
 
 **Filtering examples**
 
@@ -358,6 +444,10 @@ Both contracts emit typed Soroban events on every meaningful state change. Off-c
 
 // A specific proposal executed — filter on topics == ("tl_exec", proposal_id)
 (symbol_short!("tl_exec"), 3u64)
+
+// All pause/resume events for a specific Talos — filter on topics[1] == talos_id
+(symbol_short!("tls_paus"), 42u32)
+(symbol_short!("tls_resu"), 42u32)
 ```
 
 ### TalosNameService
@@ -365,11 +455,15 @@ Both contracts emit typed Soroban events on every meaningful state change. Off-c
 | Event | Topics | Data | Emitted on |
 |-------|--------|------|-----------| 
 | `name_reg` | `(symbol_short!("name_reg"), talos_id: u32)` | `(name: String, owner: Address)` | `register_name` success |
+| `name_reg2` | `(symbol_short!("name_reg2"), talos_id: u32)` | `(version: u32, name: String, owner: Address)` | `register_name` success (v2) |
 | `reg_upd`  | `(symbol_short!("reg_upd"),)` | `(old_registry: Address, new_registry: Address)` | registry pointer update |
 | `tl_sch`   | `(symbol_short!("tl_sch"), proposal_id: u64)` | `(action: AdminAction, eta: u64, proposer: Address)` | `schedule_action` success |
 | `tl_exec`  | `(symbol_short!("tl_exec"), proposal_id: u64)` | `(action: AdminAction, executor: Address)` | `execute_action` success |
 | `tl_cnl`   | `(symbol_short!("tl_cnl"), proposal_id: u64)` | `(action: AdminAction, canceller: Address)` | `cancel_action` success |
 | `tl_cfg`   | `(symbol_short!("tl_cfg"),)` | `(old_min_delay: u64, new_min_delay: u64, grace_period: u64)` | `set_timelock_config` success |
+| `dom_paus` | `(symbol_short!("dom_paus"), by: Address)` | `(domain_id: u32, duration: u64)` | `pause_domain` success |
+| `dom_resm` | `(symbol_short!("dom_resm"), by: Address)` | `(domain_id: u32,)` | `unpause_domain` success |
+| `dom_expd` | `(symbol_short!("dom_expd"),)` | `(domain_id: u32,)` | Auto-expiry after duration elapses |
 
 **Filtering examples**
 
@@ -649,12 +743,152 @@ stellar contract invoke \
 4. **Timelocks are per-contract, not cross-contract**: A Registry timelock and a Name Service timelock are fully independent. There is no coordinated multi-contract proposal mechanism.
 5. **Proposal IDs are sequential per contract**: IDs are 1-indexed u64 counters. They are never reused or removed from storage.
 
+## Scoped Emergency Pause Controls
+
+All three contracts implement scoped emergency pause controls for narrowly containing dangerous write paths without disabling safe reads or permanently centralizing control.
+
+### Design goals
+
+| Goal | How it is met |
+|------|--------------|
+| Scope per functional area | Each contract defines pause domains (e.g., talos creation, voting, config). Pausing one domain does not affect others. |
+| Admin-only activation | Only the protocol wallet (Registry) or admin (Name Service, Governance) can pause or unpause a domain. |
+| Auto-expiration | A duration can be set; the pause expires automatically after that time, restoring write access without any admin action. |
+| Event visibility | Every pause, unpause, and expiry emits an event (`dom_paus`, `dom_resm`, `dom_expd`) for off-chain monitoring. |
+| Safe reads preserved | Read-only functions (`get_talos`, `resolve_name`, `get_proposal`, etc.) are never blocked. Only mutation paths are guarded. |
+| Backward-compatible default | All domains are unpaused by default. No migration or configuration change is required after upgrading. |
+| Emergency recovery | If the admin key is compromised, set a short pause duration to contain damage until governance can act. |
+
+### Architecture
+
+The pause control logic lives in a shared library crate (`pause-control`) used by all three contracts. Each contract stores its own pause state under a `PauseStatus(DomainId)` persistent storage key. The library provides:
+
+- `pause_domain(env, domain_id, auth_addr, duration)` — pause a domain (requires admin auth)
+- `unpause_domain(env, domain_id, auth_addr)` — manually unpause
+- `check_not_paused(env, domain_id)` — guard: auto-expire if elapsed, then panic if still paused
+- `is_paused(env, domain_id)` — check current state
+- `get_domain_pause_status(env, domain_id)` — return full status struct
+- `expire_if_elapsed(env, domain_id)` — force expiry check (called automatically by `check_not_paused`)
+
+### Pause domains
+
+#### TalosRegistry
+
+| Domain | ID | Guarded functions |
+|--------|----|-------------------|
+| `PAUSE_TALOS_CREATION` | 1 | `create_talos` |
+| `PAUSE_TALOS_UPDATE` | 2 | `update_patron`, `update_kernel`, `update_pulse` |
+| `PAUSE_TALOS_DEACTIVATION` | 3 | `deactivate_talos` |
+| `PAUSE_PROTOCOL_CONFIG` | 4 | `set_protocol_fee`, `propose_admin`, `set_timelock_config`, `schedule_action`, `cancel_action`, `accept_admin`, `cancel_admin_transfer`, `touch_batch`, `extend_ttl_batch` |
+
+#### TalosNameService
+
+| Domain | ID | Guarded functions |
+|--------|----|-------------------|
+| `PAUSE_NAME_REGISTRATION` | 5 | `register_name` |
+| `PAUSE_NAME_CONFIG` | 6 | `set_admin`, `set_registry_contract`, `set_timelock_config`, `schedule_action`, `cancel_action`, `touch_all_ttl`, `extend_ttl_batch` |
+
+#### TalosGovernance
+
+| Domain | ID | Guarded functions |
+|--------|----|-------------------|
+| `PAUSE_PROPOSAL_CREATION` | 7 | `create_proposal` |
+| `PAUSE_GOVERNANCE_VOTING` | 8 | `vote` |
+| `PAUSE_GOVERNANCE_CONFIG` | 9 | `update_config`, `cache_token_balance`, `touch_all_ttl`, `extend_ttl_batch` |
+
+### Entry-points
+
+Each contract exposes the same four entry-points:
+
+| Entry-point | Auth | Description |
+|-------------|------|-------------|
+| `pause_domain(domain_id, duration)` | Admin | Pause a domain. `duration` in seconds (0 = indefinite, manual unpause required). |
+| `unpause_domain(domain_id)` | Admin | Unpause a previously paused domain. |
+| `is_domain_paused(domain_id)` | None | Returns `true` if paused (also auto-expires if duration has passed). |
+| `get_domain_pause_status(domain_id)` | None | Returns `{ paused, paused_by, paused_at, expires_at }` or `None` if never paused. |
+
+### Events
+
+| Event | Topics | Data | Emitted on |
+|-------|--------|------|-----------|
+| `dom_paus` | `(symbol_short!("dom_paus"), by: Address)` | `(domain_id: u32, duration: u64)` | `pause_domain` success |
+| `dom_resm` | `(symbol_short!("dom_resm"), by: Address)` | `(domain_id: u32,)` | `unpause_domain` success |
+| `dom_expd` | `(symbol_short!("dom_expd"),)` | `(domain_id: u32,)` | Auto-expiry after duration elapses |
+
+**Filtering examples**
+
+```rust
+// All pause events — filter on topics[0] == "dom_paus"
+(symbol_short!("dom_paus"),)
+
+// Pause events by a specific admin — filter on topics[1] == admin
+(symbol_short!("dom_paus"), admin_address)
+
+// Expiry events — filter on topics[0] == "dom_expd"
+(symbol_short!("dom_expd"),)
+```
+
+### CLI examples
+
+```bash
+# Pause talos creation for 1 hour (3600 seconds)
+stellar contract invoke \
+  --id "$REGISTRY_CONTRACT" \
+  --source admin-key \
+  --network testnet \
+  -- \
+  pause_domain \
+  --domain_id 1 \
+  --duration 3600
+
+# Check if domain is paused
+stellar contract invoke \
+  --id "$REGISTRY_CONTRACT" \
+  --network testnet \
+  -- \
+  is_domain_paused \
+  --domain_id 1
+
+# Unpause manually before expiry
+stellar contract invoke \
+  --id "$REGISTRY_CONTRACT" \
+  --source admin-key \
+  --network testnet \
+  -- \
+  unpause_domain \
+  --domain_id 1
+
+# Query pause status
+stellar contract invoke \
+  --id "$REGISTRY_CONTRACT" \
+  --network testnet \
+  -- \
+  get_domain_pause_status \
+  --domain_id 1
+```
+
+### Known limitations
+
+1. **Per-contract isolation**: Pausing a domain on one contract does not affect the others. Coordinated multi-contract pausing requires separate calls.
+2. **Admin key dependency**: Pause/unpause relies on the same admin key as other admin functions. If the admin key is compromised, the pause can be reversed.
+3. **Duration-based expiry is approximate**: Expiry is evaluated lazily on the next guarded write call (via `check_not_paused`). A paused state may persist slightly beyond the duration if no write occurs.
+4. **Indefinite pauses require manual unpause**: Setting `duration = 0` creates a pause that never auto-expires. The admin must explicitly call `unpause_domain` to restore writes.
+5. **No partial domain scoping**: A domain covers all its associated functions. Finer-grained control (e.g., pausing only `update_patron` but not `update_kernel`) is not supported within a single domain.
+
+### Rollback
+
+Rolling back the pause control feature is straightforward — no storage migration is required:
+
+1. **Before upgrade**: Ensure all domains are unpaused (`is_domain_paused` returns `false` for all domains).
+2. **Deploy previous WASM**: Replace the contract WASM with the version that predates pause controls. Any stored `PauseStatus` entries become inert orphan data (they will never be read).
+3. **Verify**: Confirm guarded functions execute normally.
+
 ## Interface Versioning
 
 Both `TalosRegistry` and `TalosNameService` expose a `version()` entry-point that returns the contract's interface version as `(major: u32, minor: u32, patch: u32)`.
 
-Current version: **`(1, 1, 0)`**  
-_(minor bumped from `1.0.0` when timelock entry-points were added in this release)_
+Current version: **`(1, 2, 0)`**  
+_(minor bumped from `1.1.0` when the scoped emergency pause entry-points were added in this release)_
 
 ```bash
 # Query TalosRegistry version
@@ -751,7 +985,11 @@ The test suites live in each contract's `#[cfg(test)] mod tests` block and cover
 - Two-step admin transfer (propose → accept → cancel paths)
 - Event emission for every state transition
 - Interface version consistency
+- Pause domain activation, write blocking, unpause, and auto-expiration
+- Unauthorized pause rejection and event emission verification
 
 ## License
 
 MIT
+
+See [ERRORS.md](./ERRORS.md) for typed error codes, common panic diagnostics, and caller recovery guidance.
