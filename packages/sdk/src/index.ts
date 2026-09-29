@@ -106,6 +106,13 @@ export {
   TalosEventStream,
   TalosStreamError,
   InMemorySeenStore,
+  TALOS_EVENT_SCHEMA_VERSION,
+  SCHEMA_VERSION_REQUEST_HEADER,
+  SCHEMA_VERSION_RESPONSE_HEADER,
+  SchemaVersionMismatchError,
+  negotiateSchemaVersion,
+  SSE_MAX_FIELD_BYTES,
+  SSE_MAX_DATA_LINES,
 } from "./events.js";
 export type {
   TalosEventType,
@@ -115,6 +122,7 @@ export type {
   TalosStreamCloseHandler,
   TalosEventStreamOptions,
   SeenStore,
+  SchemaVersionNegotiationResult,
 } from "./events.js";
 
 // ── Contract event decoding ───────────────────────────────────────────────────
