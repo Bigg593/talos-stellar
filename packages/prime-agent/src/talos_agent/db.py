@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -13,10 +14,14 @@ DB_PATH = APP_DIR / "talos-agent.db"
 
 
 def get_db_path(agent_id: str | None = None) -> Path:
-    """Return per-agent DB path when running multi-agent, else default."""
+    """Return per-agent DB path when running multi-agent, else default.
+
+    Resolved lazily so tests (and ops tooling) can monkeypatch ``APP_DIR``
+    to redirect `get_db_path()` without rewriting module-level constants.
+    """
     if agent_id:
         return APP_DIR / f"agent-{agent_id}.db"
-    return DB_PATH
+    return APP_DIR / "talos-agent.db"
 
 
 def normalize_playbook_name(name: str) -> str:
@@ -211,17 +216,294 @@ CREATE TABLE IF NOT EXISTS retry_state (
 );
         """,
     ),
+    (
+        7,
+        # checkpoint_keys: stores ENC::-wrapped HMAC and AES-GCM key material.
+        # key_hmac / key_enc are NEVER plaintext — always 'ENC::...' blobs.
+        """
+CREATE TABLE IF NOT EXISTS checkpoint_keys (
+    key_id       TEXT PRIMARY KEY,
+    agent_id     TEXT NOT NULL,
+    namespace    TEXT NOT NULL DEFAULT '',
+    key_hmac     TEXT NOT NULL,
+    key_enc      TEXT NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'active'
+                     CHECK(status IN ('active', 'retired')),
+    created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    retired_at   TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_checkpoint_keys_agent_status
+    ON checkpoint_keys(agent_id, status);
+        """,
+    ),
+    (
+        8,
+        # checkpoint_envelopes: persists authenticated envelope payloads.
+        # nonce has a UNIQUE constraint to prevent replay attacks.
+        """
+CREATE TABLE IF NOT EXISTS checkpoint_envelopes (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    key_id       TEXT NOT NULL REFERENCES checkpoint_keys(key_id),
+    agent_id     TEXT NOT NULL,
+    namespace    TEXT NOT NULL DEFAULT '',
+    schema_ver   INTEGER NOT NULL DEFAULT 1,
+    seq          INTEGER NOT NULL,
+    ts           TEXT NOT NULL,
+    nonce        TEXT NOT NULL UNIQUE,
+    payload      TEXT NOT NULL,
+    created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_checkpoint_envelopes_agent_ns_seq
+    ON checkpoint_envelopes(agent_id, namespace, seq);
+        """,
+    ),
+    (
+        9,
+        # claimed_jobs: durable fencing-token store so job leases survive restarts.
+        # A row exists as long as the agent holds the lease; it is deleted on
+        # fulfill / abandon.  reconcile_after_restore() re-validates rows against
+        # the authoritative API and prunes any whose lease is no longer ours.
+        #
+        # completion_markers: idempotency log.  Before completing any job the
+        # agent writes a marker; on restore, duplicate markers are detected and
+        # the work is skipped.  Rows are retained for 7 days (pruned at startup).
+        """
+CREATE TABLE IF NOT EXISTS claimed_jobs (
+    job_id          TEXT PRIMARY KEY,
+    fencing_token   INTEGER NOT NULL,
+    claimed_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    lease_expires_at TEXT,
+    ttl_seconds     INTEGER NOT NULL DEFAULT 300
+);
+
+CREATE TABLE IF NOT EXISTS completion_markers (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id          TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    completed_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    expires_at      TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_completion_markers_job_id
+    ON completion_markers(job_id);
+CREATE INDEX IF NOT EXISTS idx_completion_markers_expires_at
+    ON completion_markers(expires_at);
+        """,
+    ),
+    (
+        10,
+        # Secret rotation tables (re-homed after checkpoint migrations claimed 7-9)
+        # plus named rollback checkpoints for safe rotation recovery.
+        """
+CREATE TABLE IF NOT EXISTS secret_versions (
+    scope           TEXT NOT NULL,
+    name            TEXT NOT NULL,
+    version         INTEGER NOT NULL,
+    ciphertext      TEXT NOT NULL,
+    key_id          TEXT NOT NULL,
+    status          TEXT NOT NULL CHECK (status IN ('staged', 'active', 'superseded', 'revoked')),
+    request_id      TEXT NOT NULL,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    activated_at    TEXT,
+    revoked_at      TEXT,
+    PRIMARY KEY (scope, name, version),
+    UNIQUE (scope, name, request_id)
+);
+
+CREATE TABLE IF NOT EXISTS secret_heads (
+    scope             TEXT NOT NULL,
+    name              TEXT NOT NULL,
+    active_version    INTEGER NOT NULL,
+    previous_version  INTEGER,
+    generation        INTEGER NOT NULL DEFAULT 1,
+    updated_at        TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (scope, name)
+);
+
+CREATE TABLE IF NOT EXISTS secret_audit_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id    TEXT NOT NULL UNIQUE,
+    scope       TEXT NOT NULL,
+    name        TEXT NOT NULL,
+    version     INTEGER,
+    event_type  TEXT NOT NULL,
+    outcome     TEXT NOT NULL,
+    actor       TEXT NOT NULL,
+    reason      TEXT,
+    metadata    TEXT NOT NULL DEFAULT '{}',
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS secret_rollback_checkpoints (
+    scope              TEXT NOT NULL,
+    name               TEXT NOT NULL,
+    checkpoint_id      TEXT NOT NULL,
+    active_version     INTEGER NOT NULL,
+    previous_version   INTEGER,
+    generation         INTEGER NOT NULL,
+    request_id         TEXT NOT NULL,
+    actor              TEXT NOT NULL,
+    reason             TEXT,
+    status             TEXT NOT NULL CHECK (status IN ('open', 'restored', 'discarded')),
+    created_at         TEXT NOT NULL DEFAULT (datetime('now')),
+    restored_at        TEXT,
+    discarded_at       TEXT,
+    PRIMARY KEY (scope, name, checkpoint_id),
+    UNIQUE (scope, name, request_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_secret_versions_status
+    ON secret_versions(scope, name, status);
+CREATE INDEX IF NOT EXISTS idx_secret_audit_lookup
+    ON secret_audit_events(scope, name, id);
+CREATE INDEX IF NOT EXISTS idx_secret_checkpoints_status
+    ON secret_rollback_checkpoints(scope, name, status);
+        """,
+    ),
+    (
+        10,
+        # Restore durable job inbox/outbox if an earlier migration collision
+        # dropped them, and add an append-only audit trail for effect replay.
+        """
+CREATE TABLE IF NOT EXISTS job_inbox (
+    owner_talos_id         TEXT NOT NULL,
+    job_id                 TEXT NOT NULL,
+    requester_talos_id     TEXT,
+    service_type           TEXT NOT NULL,
+    payload_json           TEXT NOT NULL,
+    payload_digest         TEXT NOT NULL,
+    state                  TEXT NOT NULL DEFAULT 'received'
+                           CHECK (state IN (
+                               'received', 'claimed', 'effect_pending',
+                               'completed', 'conflict'
+                           )),
+    fencing_token          INTEGER,
+    remote_lease_expires_at TEXT,
+    completed_at           TEXT,
+    created_at             TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at             TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (owner_talos_id, job_id)
+);
+
+CREATE TABLE IF NOT EXISTS job_effect_outbox (
+    effect_id          TEXT PRIMARY KEY,
+    owner_talos_id     TEXT NOT NULL,
+    job_id             TEXT NOT NULL,
+    effect_type        TEXT NOT NULL,
+    deduplication_key  TEXT NOT NULL,
+    result_json        TEXT NOT NULL,
+    result_digest      TEXT NOT NULL,
+    fencing_token      INTEGER NOT NULL,
+    state              TEXT NOT NULL DEFAULT 'pending'
+                       CHECK (state IN (
+                           'pending', 'dispatching', 'succeeded', 'retryable',
+                           'indeterminate', 'conflict', 'dead'
+                       )),
+    attempt_count      INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at    TEXT NOT NULL,
+    lease_owner        TEXT,
+    lease_until        TEXT,
+    last_error_code    TEXT,
+    created_at         TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at         TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (owner_talos_id, deduplication_key),
+    FOREIGN KEY (owner_talos_id, job_id)
+        REFERENCES job_inbox(owner_talos_id, job_id)
+);
+
+CREATE TABLE IF NOT EXISTS job_effect_replay_audit (
+    audit_id        TEXT PRIMARY KEY,
+    owner_talos_id  TEXT NOT NULL,
+    effect_id       TEXT NOT NULL,
+    job_id          TEXT NOT NULL,
+    action          TEXT NOT NULL
+                    CHECK (action IN (
+                        'effect_prepared',
+                        'dispatch_claimed',
+                        'dispatch_succeeded',
+                        'dispatch_reconciled',
+                        'dispatch_failed',
+                        'dispatch_conflict',
+                        'operator_requeued'
+                    )),
+    from_state      TEXT,
+    to_state        TEXT NOT NULL,
+    attempt_count   INTEGER NOT NULL DEFAULT 0,
+    error_code      TEXT,
+    actor           TEXT NOT NULL,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_job_inbox_state
+    ON job_inbox(owner_talos_id, state, created_at);
+CREATE INDEX IF NOT EXISTS idx_job_effect_outbox_due
+    ON job_effect_outbox(owner_talos_id, state, next_attempt_at, lease_until);
+CREATE INDEX IF NOT EXISTS idx_job_effect_replay_audit_effect
+    ON job_effect_replay_audit(owner_talos_id, effect_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_job_effect_replay_audit_job
+    ON job_effect_replay_audit(owner_talos_id, job_id, created_at);
+        """,
+    ),
+    (
+        11,
+        # Durable Telegram send queue. Stores message text and chat target only:
+        # never bot tokens, request URLs, or raw Telegram error bodies.
+        # Times are UTC epoch seconds (REAL) so ordering never depends on text formats.
+        """
+CREATE TABLE IF NOT EXISTS telegram_send_queue (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    dedupe_key          TEXT UNIQUE,
+    chat_id             TEXT NOT NULL,
+    kind                TEXT NOT NULL CHECK (kind IN ('post', 'reply')),
+    text                TEXT NOT NULL,
+    reply_to_message_id INTEGER,
+    state               TEXT NOT NULL DEFAULT 'pending'
+        CHECK (state IN ('pending', 'sending', 'sent', 'failed', 'indeterminate')),
+    attempt_count       INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at     REAL NOT NULL,
+    last_attempt_at     REAL,
+    lease_expires_at    REAL,
+    message_id          INTEGER,
+    last_error_code     TEXT,
+    created_at          REAL NOT NULL,
+    updated_at          REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS telegram_rate_state (
+    chat_id       TEXT PRIMARY KEY,
+    blocked_until REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_telegram_send_queue_state
+    ON telegram_send_queue(state, id);
+CREATE INDEX IF NOT EXISTS idx_telegram_send_queue_attempts
+    ON telegram_send_queue(chat_id, last_attempt_at);
+        """,
+    ),
 ]
 
 
 class LocalDB:
-    def __init__(self, path: Path = DB_PATH):
+    def __init__(self, path: Path = DB_PATH, *, timeout_ms: int = 5000):
         self._path = path
         path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(path))
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            # Some platforms/filesystems do not implement POSIX modes.
+            pass
         self._conn.row_factory = sqlite3.Row
+        self._conn.execute(f"PRAGMA busy_timeout = {max(timeout_ms, 1)}")
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._run_migrations()
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            # Some platforms/filesystems do not expose POSIX permissions.
+            pass
 
     def _run_migrations(self) -> None:
         """Run all pending migrations in a single transaction."""
@@ -591,6 +873,29 @@ class LocalDB:
         )
         self._conn.commit()
 
+    def evict_expired_learnings(self, *, now: datetime | None = None) -> dict:
+        """Delete strategy learnings whose expires_at is in the past.
+
+        Learnings with NULL expires_at are retained (no TTL). Returns a
+        privacy-safe summary — ids only, never insight text.
+        """
+        clock = now or datetime.now(timezone.utc)
+        # Compare as ISO-8601 strings; save_learning stores aware UTC isoformat.
+        cutoff = clock.isoformat()
+        rows = self._conn.execute(
+            "SELECT id FROM strategy_learnings "
+            "WHERE expires_at IS NOT NULL AND expires_at <= ?",
+            (cutoff,),
+        ).fetchall()
+        ids = [int(r["id"] if isinstance(r, dict) or hasattr(r, "keys") else r[0]) for r in rows]
+        if ids:
+            self._conn.execute(
+                f"DELETE FROM strategy_learnings WHERE id IN ({','.join('?' for _ in ids)})",
+                ids,
+            )
+            self._conn.commit()
+        return {"evicted": len(ids), "ids": ids}
+
     # ── Audience Insights ──────────────────────────────────
 
     def upsert_audience_insight(
@@ -681,8 +986,6 @@ class LocalDB:
         repayment_address: str | None = None,
     ) -> int:
         """Create a new loan record and return its ID."""
-        from datetime import datetime, timedelta, timezone
-
         created_at = datetime.now(timezone.utc)
         due_date = created_at + timedelta(days=duration_days)
 
@@ -806,7 +1109,263 @@ class LocalDB:
         )
         self._conn.commit()
 
+    # ── Claimed Jobs (fencing-token persistence) ───────────
+
+    def upsert_claimed_job(
+        self,
+        job_id: str,
+        fencing_token: int,
+        ttl_seconds: int = 300,
+        lease_expires_at: datetime | None = None,
+    ) -> None:
+        """Persist a claimed job's fencing token so it survives restarts.
+
+        ``lease_expires_at`` is the server-reported wall-clock time at which
+        the lease expires.  When ``None`` it is approximated from
+        ``claimed_at + ttl_seconds``.
+        """
+        if not job_id or not isinstance(job_id, str):
+            raise ValueError("job_id must be a non-empty string")
+        if not isinstance(fencing_token, int) or fencing_token < 0:
+            raise ValueError("fencing_token must be a non-negative integer")
+        if ttl_seconds <= 0:
+            raise ValueError("ttl_seconds must be positive")
+
+        expires_iso = (
+            lease_expires_at.isoformat()
+            if lease_expires_at is not None
+            else (datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)).isoformat()
+        )
+        self._conn.execute(
+            """INSERT INTO claimed_jobs (job_id, fencing_token, lease_expires_at, ttl_seconds)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(job_id) DO UPDATE SET
+                   fencing_token   = excluded.fencing_token,
+                   lease_expires_at = excluded.lease_expires_at,
+                   ttl_seconds     = excluded.ttl_seconds""",
+            (job_id, fencing_token, expires_iso, ttl_seconds),
+        )
+        self._conn.commit()
+
+    def get_claimed_job(self, job_id: str) -> dict | None:
+        """Return the persisted claim for *job_id*, or ``None`` if not found."""
+        row = self._conn.execute(
+            "SELECT job_id, fencing_token, claimed_at, lease_expires_at, ttl_seconds "
+            "FROM claimed_jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "job_id": row["job_id"],
+            "fencing_token": int(row["fencing_token"]),
+            "claimed_at": datetime.fromisoformat(row["claimed_at"]),
+            "lease_expires_at": (
+                datetime.fromisoformat(row["lease_expires_at"])
+                if row["lease_expires_at"]
+                else None
+            ),
+            "ttl_seconds": int(row["ttl_seconds"]),
+        }
+
+    def get_all_claimed_jobs(self) -> list[dict]:
+        """Return all persisted claimed jobs (used during restore reconciliation)."""
+        rows = self._conn.execute(
+            "SELECT job_id, fencing_token, claimed_at, lease_expires_at, ttl_seconds "
+            "FROM claimed_jobs"
+        ).fetchall()
+        result = []
+        for row in rows:
+            result.append(
+                {
+                    "job_id": row["job_id"],
+                    "fencing_token": int(row["fencing_token"]),
+                    "claimed_at": datetime.fromisoformat(row["claimed_at"]),
+                    "lease_expires_at": (
+                        datetime.fromisoformat(row["lease_expires_at"])
+                        if row["lease_expires_at"]
+                        else None
+                    ),
+                    "ttl_seconds": int(row["ttl_seconds"]),
+                }
+            )
+        return result
+
+    def delete_claimed_job(self, job_id: str) -> None:
+        """Remove a claimed-job record (after fulfillment or abandon)."""
+        self._conn.execute("DELETE FROM claimed_jobs WHERE job_id = ?", (job_id,))
+        self._conn.commit()
+
+    # ── Completion Markers (idempotency log) ───────────────
+
+    def add_completion_marker(
+        self,
+        job_id: str,
+        idempotency_key: str,
+        retain_days: int = 7,
+    ) -> None:
+        """Write a completion marker for *job_id* / *idempotency_key*.
+
+        Raises ``sqlite3.IntegrityError`` if the ``idempotency_key`` is already
+        present — the caller should catch this and skip re-doing the work.
+
+        Parameters
+        ----------
+        job_id:
+            The job being completed.
+        idempotency_key:
+            A unique key for this completion attempt, e.g.
+            ``f"{job_id}:{result_hash}"``.  Must be unique across all jobs.
+        retain_days:
+            How many days the marker is kept before expiry.  Expired markers
+            are pruned by :meth:`prune_expired_completion_markers`.
+        """
+        if not job_id or not isinstance(job_id, str):
+            raise ValueError("job_id must be a non-empty string")
+        if not idempotency_key or not isinstance(idempotency_key, str):
+            raise ValueError("idempotency_key must be a non-empty string")
+        if retain_days <= 0:
+            raise ValueError("retain_days must be positive")
+
+        expires_at = (
+            datetime.now(timezone.utc) + timedelta(days=retain_days)
+        ).isoformat()
+        self._conn.execute(
+            "INSERT INTO completion_markers (job_id, idempotency_key, expires_at) "
+            "VALUES (?, ?, ?)",
+            (job_id, idempotency_key, expires_at),
+        )
+        self._conn.commit()
+
+    def has_completion_marker(self, idempotency_key: str) -> bool:
+        """Return ``True`` if a non-expired marker with this key exists."""
+        row = self._conn.execute(
+            "SELECT 1 FROM completion_markers "
+            "WHERE idempotency_key = ? AND expires_at > datetime('now')",
+            (idempotency_key,),
+        ).fetchone()
+        return row is not None
+
+    def get_completion_markers_for_job(self, job_id: str) -> list[dict]:
+        """Return all non-expired completion markers for a job (used in duplicate detection)."""
+        rows = self._conn.execute(
+            "SELECT id, job_id, idempotency_key, completed_at, expires_at "
+            "FROM completion_markers "
+            "WHERE job_id = ? AND expires_at > datetime('now') "
+            "ORDER BY completed_at DESC",
+            (job_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def prune_expired_completion_markers(self) -> int:
+        """Delete expired completion markers. Returns the number of rows removed."""
+        cursor = self._conn.execute(
+            "DELETE FROM completion_markers WHERE expires_at <= datetime('now')"
+        )
+        self._conn.commit()
+        return cursor.rowcount
+
+    # ── WAL health ─────────────────────────────────────────
+
+    def wal_health(
+        self,
+        *,
+        run_checkpoint: bool = True,
+        run_quick_check: bool = True,
+    ):
+        """Return privacy-safe SQLite WAL health diagnostics for this DB.
+
+        Reuses the open connection. Does not close it. Secrets and row
+        payloads are never included in the report.
+        """
+        from talos_agent.wal_health import collect_wal_health
+
+        return collect_wal_health(
+            path=self._path,
+            conn=self._conn,
+            run_checkpoint=run_checkpoint,
+            run_quick_check=run_quick_check,
+        )
+
     # ── Cleanup ────────────────────────────────────────────
 
     def close(self) -> None:
         self._conn.close()
+
+    # ── Replay Sessions ────────────────────────────────────
+
+    def create_replay_session(
+        self,
+        session_id: str,
+        talos_id: str,
+        agent_version: str,
+        started_at: str,
+    ) -> None:
+        """Create a new replay session record."""
+        self._conn.execute(
+            """INSERT OR IGNORE INTO replay_sessions
+               (session_id, talos_id, agent_version, started_at, status)
+               VALUES (?, ?, ?, ?, 'recording')""",
+            (session_id, talos_id, agent_version, started_at),
+        )
+        self._conn.commit()
+
+    def finish_replay_session(self, session_id: str, status: str = "completed") -> None:
+        """Mark a replay session as finished."""
+        ended_at = datetime.now(timezone.utc).isoformat()
+        self._conn.execute(
+            """UPDATE replay_sessions
+               SET status = ?, ended_at = ?
+               WHERE session_id = ?""",
+            (status, ended_at, session_id),
+        )
+        self._conn.commit()
+
+    def insert_replay_event(
+        self,
+        session_id: str,
+        event_id: str,
+        event_type: str,
+        payload_json: str,
+        redacted: bool = False,
+    ) -> None:
+        """Insert a single replay event."""
+        self._conn.execute(
+            """INSERT INTO replay_events
+               (session_id, event_id, event_type, payload, redacted)
+               VALUES (?, ?, ?, ?, ?)""",
+            (session_id, event_id, event_type, payload_json, int(redacted)),
+        )
+        self._conn.commit()
+
+    def get_replay_events(self, session_id: str) -> list[sqlite3.Row]:
+        """Return all replay events for a session ordered by insertion."""
+        rows = self._conn.execute(
+            """SELECT event_id, event_type, payload, redacted, recorded_at
+               FROM replay_events WHERE session_id = ?
+               ORDER BY id ASC""",
+            (session_id,),
+        ).fetchall()
+        return list(rows)
+
+    def list_replay_sessions(
+        self,
+        talos_id: str | None = None,
+        limit: int = 20,
+    ) -> list[sqlite3.Row]:
+        """List recent replay sessions, optionally filtered by talos_id."""
+        if talos_id:
+            rows = self._conn.execute(
+                """SELECT session_id, talos_id, agent_version, started_at, ended_at, status
+                   FROM replay_sessions WHERE talos_id = ?
+                   ORDER BY created_at DESC LIMIT ?""",
+                (talos_id, limit),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                """SELECT session_id, talos_id, agent_version, started_at, ended_at, status
+                   FROM replay_sessions
+                   ORDER BY created_at DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        return list(rows)

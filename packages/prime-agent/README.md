@@ -2,6 +2,188 @@
 
 Autonomous agent corporation runtime for Stellar GTM agents.
 
+## API Client Response Size Cap (issue #561)
+
+All HTTP responses from the Talos Web API are bounded before the body is
+decoded. This prevents memory exhaustion from oversized or malicious responses
+and closes a potential information-disclosure path where a very large response
+could be logged or stored.
+
+### How it works
+
+1. **Content-Length fast-reject** — if the server declares a body size that
+   already exceeds the limit, the request is rejected immediately before any
+   body bytes are read.
+2. **Body measurement** — after httpx buffers the response, `len(response.content)`
+   is checked as the authoritative byte count. This catches cases where the
+   server omits or lies about `Content-Length`.
+3. **`ResponseTooLargeError`** — raised on any violation. The error carries only
+   `url_path`, `actual_bytes`, and `limit_bytes`. Response bodies, headers,
+   secrets, seeds, and payment proofs are never included in the error.
+
+### Configuration
+
+| Variable | Default | Range | Description |
+|---|---|---|---|
+| `TALOS_API_CLIENT_RESPONSE_MAX_BYTES` | `1048576` (1 MiB) | 1 KiB–100 MiB | Maximum allowed response body size |
+
+To tighten the cap in a constrained environment:
+
+```bash
+TALOS_API_CLIENT_RESPONSE_MAX_BYTES=262144  # 256 KiB
+```
+
+### Error handling
+
+`ResponseTooLargeError` is importable from `talos_agent.http`. Callers that
+need to handle it explicitly can do so:
+
+```python
+from talos_agent.http import ResponseTooLargeError
+
+try:
+    result = await api_client.get_talos(talos_id)
+except ResponseTooLargeError as exc:
+    logger.warning(
+        "API response too large path=%s actual=%d limit=%d",
+        exc.url_path, exc.actual_bytes, exc.limit_bytes,
+    )
+```
+
+### Compatibility
+
+All existing public methods (`get_talos`, `report_activity`, `update_status`,
+`get_pending_jobs`, etc.) are unaffected — typical JSON responses are well
+under 1 MiB. The cap only fires on responses that exceed the configured limit.
+
+## Checkpoint Export and Inspection
+
+The checkpoint CLI provides safe operator commands for exporting and inspecting an agent checkpoint without modifying the running agent or its SQLite database.
+
+Exports are deterministic, size-bounded, and written atomically. Inspection supports both human-readable and JSON output while exposing only non-sensitive checkpoint metadata.
+
+### Export a Checkpoint
+
+```bash
+talos-agent checkpoint export \
+  --agent agent-1 \
+  --output checkpoint.json
+```
+
+Available options:
+
+* `--agent`: Agent identifier. Required.
+* `--output`: Destination checkpoint file. Required.
+* `--schema-version`: Checkpoint schema version. Defaults to `1`.
+* `--max-size`: Maximum permitted output size in bytes. Defaults to 10 MiB.
+
+The source database is opened using SQLite read-only mode with query-only enforcement. Export runs inside a consistent read transaction so all table counts come from one database snapshot, even when the agent is active.
+
+The destination is written through a temporary file, flushed to disk, and atomically moved into place. Repeated exports to the same destination replace the previous file with a complete checkpoint and never leave partial output.
+
+The command refuses to use the source agent database as the output path.
+
+### Inspect a Checkpoint
+
+Human-readable output:
+
+```bash
+talos-agent checkpoint inspect \
+  --input checkpoint.json
+```
+
+JSON output:
+
+```bash
+talos-agent checkpoint inspect \
+  --input checkpoint.json \
+  --json
+```
+
+Available options:
+
+* `--input`: Checkpoint file to inspect. Required.
+* `--json`: Return the summary as JSON.
+* `--max-size`: Maximum permitted input size in bytes. Defaults to 10 MiB.
+
+Inspection validates:
+
+* JSON document structure
+* Supported schema version
+* Agent identifier format
+* Recognised checkpoint table names
+* Non-negative integer row counts
+* Configured file-size bounds
+
+### Checkpoint Contents
+
+Checkpoint schema version `1` contains operator-safe metadata:
+
+* Agent identifier
+* Schema version
+* Row counts for recognised agent-state tables
+
+Stored row values are not included. This prevents the commands from exposing credentials, configuration values, generated content, job payloads, wallet details, transaction data, approval descriptions, or other sensitive information.
+
+### Exit Codes
+
+| Code | Meaning                                                           |
+| ---- | ----------------------------------------------------------------- |
+| `0`  | Command completed successfully                                    |
+| `2`  | Invalid arguments, invalid checkpoint data, or size-limit failure |
+| `3`  | Unsupported checkpoint schema version                             |
+| `4`  | Database, filesystem, or permission failure                       |
+
+These exit codes are stable and may be used by shell scripts and operator tooling.
+
+### Authorisation
+
+Checkpoint access follows the local operating-system permission boundary.
+
+The invoking user must have permission to:
+
+* Read the selected agent database
+* Read checkpoint files being inspected
+* Write to the selected export directory
+
+Permission failures produce a clear access-denied message and return exit code `4`.
+
+### Deterministic Behaviour
+
+* Concurrent exports never leave partial checkpoint files.
+* Repeated exports of unchanged state produce identical checkpoint bytes.
+* Interrupted exports remove temporary files and preserve any existing destination.
+* Failed exports do not modify the source database or damage an existing checkpoint.
+* Exported checkpoints remain inspectable across separate CLI invocations and process restarts.
+
+Retry and network-timeout behaviour are not required because export and inspection operate only on bounded local SQLite and filesystem resources.
+
+### Observability
+
+A successful export prints the final checkpoint destination.
+
+Validation, compatibility, permission, and I/O failures print a clear error message and return the corresponding stable exit code. Sensitive database values are never written to command output.
+
+### Migration and Rollback
+
+Checkpoint export does not initialise `LocalDB`, run migrations, change `PRAGMA user_version`, create database tables, or modify runtime state.
+
+No database rollback procedure is required because the source operation is read-only. To remove an exported checkpoint, delete the generated file.
+
+Failed or cancelled exports preserve the previous destination file and clean up temporary files automatically.
+
+### Scope Boundaries
+
+These commands provide the operator-facing export and inspection workflow for checkpoint schema version `1`.
+
+Checkpoint restoration, encryption, remote storage, retention policies, and scheduled exports are separate lifecycle capabilities and are not performed by these commands.
+
+### Implementation Files
+
+* [`src/talos_agent/checkpoint_cli.py`](./src/talos_agent/checkpoint_cli.py) contains the checkpoint export and inspection commands, validation, atomic file handling, read-only database access, summary formatting, and stable exit-code handling.
+* [`src/talos_agent/cli.py`](./src/talos_agent/cli.py) registers the `checkpoint` command group with the main `talos-agent` CLI.
+* [`tests/test_checkpoint_cli.py`](./tests/test_checkpoint_cli.py) contains unit and real SQLite boundary tests covering successful exports, inspection, validation failures, permissions, size limits, concurrency, duplicate exports, cancellation, restart behaviour, and source-state protection.
+
 ## Database Migrations
 
 This package implements an automated schema versioning and migration framework using SQLite's native `PRAGMA user_version` capability.
@@ -60,6 +242,44 @@ _MIGRATIONS.append(
    ```
 3. Deploy. The database will automatically upgrade on startup.
 
+## Coverage Enforcement (issue #638)
+
+Critical agent modules — payments, crypto/secrets, durability (checkpoint/
+restore/db), scheduling, policy engine, and network resilience — carry a hard
+**per-module** coverage floor. Thresholds live in one place:
+`COVERAGE_FLOORS` in [`scripts/check-coverage.py`](./scripts/check-coverage.py).
+The global `fail_under` backstop lives in `[tool.coverage.report]` in
+`pyproject.toml`.
+
+### Exact local commands
+
+```bash
+cd packages/prime-agent
+
+# 1. Run the suite with coverage enabled (produces coverage.json)
+uv run pytest tests/ --cov --cov-report=json --cov-report=term
+
+# 2. Run the per-module gate (same command CI runs)
+uv run python scripts/check-coverage.py coverage.json
+```
+
+The gate exits `0` when every critical module is at or above its floor and `1`
+with an explicit per-module failure list otherwise. It also fails closed on a
+missing, malformed, or unexpected-format report instead of silently passing.
+
+### Raising the floor / adding a module
+
+1. Improve tests for the module until its reported percentage meets the new
+   floor.
+2. Update (or add) the entry in `COVERAGE_FLOORS` in
+   `scripts/check-coverage.py`.
+3. Re-run both commands above.
+
+Non-critical modules are covered by the global `fail_under` backstop in
+`pyproject.toml` rather than a per-module floor, so unrelated low-coverage code
+does not block unrelated work. When a module becomes load-bearing (money,
+identity, durability), add it to `COVERAGE_FLOORS`.
+
 ## Deployment
 
 ### Running the Docker Container
@@ -75,3 +295,27 @@ docker build -t prime-agent .
 docker run --rm prime-agent
 ```
 
+## Durable provider-job effects
+
+The opt-in durable inbox/outbox prevents provider job results from being lost
+or executed twice across crashes. It is disabled by default with
+`TALOS_DURABLE_JOB_EFFECTS_ENABLED=false`.
+
+Before enabling it, read the
+[durable job effects runbook](../../docs/prime-agent-durable-job-effects.md).
+The runbook documents the exact external idempotency boundary, configuration,
+migration, structured operational events, metadata-only replay inspection,
+recovery procedure, known limitations, and rollback steps.
+
+## Stellar transaction retry failures
+
+Stellar transfer failures are classified as `retryable`, `rate_limited`,
+`indeterminate`, `permanent`, or `unknown` so callers and operators can decide
+whether a transaction is safe to retry. The classification is privacy-safe —
+no seeds, payment proofs, or raw upstream text are logged or returned — and is
+surfaced through the existing payment proxy and tool results.
+
+See the
+[Stellar retry failure runbook](../../docs/prime-agent-stellar-retry-failures.md)
+for the input → class mapping, privacy guarantees, compatibility notes, and
+how to consume the classification.
