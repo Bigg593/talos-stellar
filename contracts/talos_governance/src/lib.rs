@@ -32,6 +32,7 @@ pub enum ProposalStatus {
     Approved,
     Rejected,
     Executed,
+    Cancelled,
 }
 
 #[contracttype]
@@ -466,6 +467,32 @@ impl TalosGovernance {
 
         emit_proposal_created(&env, proposal_id, talos_id, proposer, snapshot_ledger, end_ledger);
         proposal_id
+    }
+
+    pub fn cancel_proposal(env: Env, proposer: Address, proposal_id: u32) {
+        proposer.require_auth();
+
+        let mut proposal: Proposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Proposal(proposal_id))
+            .expect("Proposal not found");
+
+        if proposal.proposer != proposer {
+            panic!("Only the proposer can cancel this proposal");
+        }
+        if proposal.status != ProposalStatus::Active {
+            panic!("Only active proposals can be cancelled");
+        }
+        if proposal.total_voters > 0 {
+            panic!("Cannot cancel a proposal that has already received votes");
+        }
+
+        proposal.status = ProposalStatus::Cancelled;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+        emit_proposal_status_changed(&env, proposal_id, ProposalStatus::Cancelled);
     }
 
     pub fn vote(env: Env, voter: Address, proposal_id: u32, choice: VoteChoice) {
@@ -3046,5 +3073,230 @@ mod tests {
             "rejected create_proposal memory {} exceeded ceiling {}",
             mem, BUDGET_MEM_CREATE_PROPOSAL,
         );
+    }
+
+    // ── cancel_proposal tests (#851) ─────────────────────────────────────────
+
+    #[test]
+    fn proposer_can_cancel_fresh_proposal() {
+        let (env, contract_id, _admin, _pulse, client) = setup();
+        let proposer = Address::generate(&env);
+        let proposal_id = create_proposal_with_auth(&env, &contract_id, &client, &proposer);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &proposer,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "cancel_proposal",
+                    args: (proposer.clone(), proposal_id).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .cancel_proposal(&proposer, &proposal_id);
+
+        let proposal = client.get_proposal(&proposal_id).unwrap();
+        assert_eq!(proposal.status, ProposalStatus::Cancelled);
+    }
+
+    #[test]
+    fn cancel_emits_proposal_status_changed_event() {
+        let (env, contract_id, _admin, _pulse, client) = setup();
+        let proposer = Address::generate(&env);
+        let proposal_id = create_proposal_with_auth(&env, &contract_id, &client, &proposer);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &proposer,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "cancel_proposal",
+                    args: (proposer.clone(), proposal_id).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .cancel_proposal(&proposer, &proposal_id);
+
+        let events = env.events().all();
+        let stat_event = events.iter().find(|(cid, topics, _)| {
+            if *cid != contract_id { return false; }
+            if let Some(t0) = topics.get(0) {
+                let s: soroban_sdk::Symbol = soroban_sdk::FromVal::from_val(&env, &t0);
+                s == symbol_short!("prop_stat")
+            } else { false }
+        });
+        assert!(stat_event.is_some(), "prop_stat event must be emitted on cancel");
+
+        let (_, _, data) = stat_event.unwrap();
+        let payload: EventProposalStatusChanged = soroban_sdk::FromVal::from_val(&env, &data);
+        assert_eq!(payload.proposal_id, proposal_id);
+        assert_eq!(payload.status, ProposalStatus::Cancelled);
+    }
+
+    #[test]
+    #[should_panic(expected = "Only the proposer can cancel this proposal")]
+    fn non_proposer_cannot_cancel() {
+        let (env, contract_id, _admin, _pulse, client) = setup();
+        let proposer = Address::generate(&env);
+        let other = Address::generate(&env);
+        let proposal_id = create_proposal_with_auth(&env, &contract_id, &client, &proposer);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &other,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "cancel_proposal",
+                    args: (other.clone(), proposal_id).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .cancel_proposal(&other, &proposal_id);
+    }
+
+    #[test]
+    #[should_panic(expected = "Cannot cancel a proposal that has already received votes")]
+    fn cancel_after_vote_fails() {
+        let (env, contract_id, admin, _pulse, client) = setup();
+        let proposer = Address::generate(&env);
+        let voter = Address::generate(&env);
+        let proposal_id = create_proposal_with_auth(&env, &contract_id, &client, &proposer);
+        let proposal = client.get_proposal(&proposal_id).unwrap();
+
+        // Cache a small balance that won't trigger quorum (< 100)
+        cache_balance_with_auth(
+            &env, &contract_id, &client, &admin,
+            proposal.snapshot_ledger, &voter, 1,
+        );
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &voter,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "vote",
+                    args: (voter.clone(), proposal_id, VoteChoice::Approve).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .vote(&voter, &proposal_id, &VoteChoice::Approve);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &proposer,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "cancel_proposal",
+                    args: (proposer.clone(), proposal_id).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .cancel_proposal(&proposer, &proposal_id);
+    }
+
+    #[test]
+    #[should_panic(expected = "Only active proposals can be cancelled")]
+    fn cancel_already_cancelled_fails() {
+        let (env, contract_id, _admin, _pulse, client) = setup();
+        let proposer = Address::generate(&env);
+        let proposal_id = create_proposal_with_auth(&env, &contract_id, &client, &proposer);
+
+        for _ in 0..2 {
+            client
+                .mock_auths(&[MockAuth {
+                    address: &proposer,
+                    invoke: &MockAuthInvoke {
+                        contract: &contract_id,
+                        fn_name: "cancel_proposal",
+                        args: (proposer.clone(), proposal_id).into_val(&env),
+                        sub_invokes: &[],
+                    },
+                }])
+                .cancel_proposal(&proposer, &proposal_id);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "Proposal is not active")]
+    fn cancelled_proposal_cannot_be_voted_on() {
+        let (env, contract_id, admin, _pulse, client) = setup();
+        let proposer = Address::generate(&env);
+        let voter = Address::generate(&env);
+        let proposal_id = create_proposal_with_auth(&env, &contract_id, &client, &proposer);
+        let proposal = client.get_proposal(&proposal_id).unwrap();
+
+        cache_balance_with_auth(
+            &env, &contract_id, &client, &admin,
+            proposal.snapshot_ledger, &voter, 50,
+        );
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &proposer,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "cancel_proposal",
+                    args: (proposer.clone(), proposal_id).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .cancel_proposal(&proposer, &proposal_id);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &voter,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "vote",
+                    args: (voter.clone(), proposal_id, VoteChoice::Approve).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .vote(&voter, &proposal_id, &VoteChoice::Approve);
+    }
+
+    #[test]
+    #[should_panic(expected = "Proposal is not active")]
+    fn cancelled_proposal_cannot_be_finalized() {
+        let (env, contract_id, _admin, _pulse, client) = setup();
+        let proposer = Address::generate(&env);
+        let proposal_id = create_proposal_with_auth(&env, &contract_id, &client, &proposer);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &proposer,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "cancel_proposal",
+                    args: (proposer.clone(), proposal_id).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .cancel_proposal(&proposer, &proposal_id);
+
+        env.ledger().with_mut(|li| { li.sequence_number = 200; });
+        client.finalize_proposal(&proposal_id);
+    }
+
+    #[test]
+    #[should_panic(expected = "Proposal is not approved")]
+    fn cancelled_proposal_cannot_be_executed() {
+        let (env, contract_id, _admin, _pulse, client) = setup();
+        let proposer = Address::generate(&env);
+        let proposal_id = create_proposal_with_auth(&env, &contract_id, &client, &proposer);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &proposer,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "cancel_proposal",
+                    args: (proposer.clone(), proposal_id).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .cancel_proposal(&proposer, &proposal_id);
+
+        client.execute_proposal(&proposal_id);
     }
 }
