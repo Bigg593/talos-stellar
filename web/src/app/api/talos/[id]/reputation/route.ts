@@ -1,190 +1,222 @@
+import { withRequestId } from "@/lib/with-request-id";
+import { NextRequest } from "next/server";
 import { db } from "@/db";
+import { tlsReputationInputs, tlsTalos } from "@/db/schema";
+import { and, desc, eq, sql } from "drizzle-orm";
+import { z } from "zod/v4";
 import {
-  tlsTalos,
-  tlsRevenues,
-  tlsActivities,
-  tlsApprovals,
-  tlsPatrons,
-  tlsCommerceJobs,
-} from "@/db/schema";
-import { and, eq, gte, sql } from "drizzle-orm";
+  computeReputation,
+  REPUTATION_SCORE_VERSION,
+  reputationInputsSchema,
+  ReputationJobInput,
+  MAX_JOB_AGE_DAYS,
+} from "@/lib/reputation";
 
-// GET /api/talos/:id/reputation — Reputation score derived from on-chain activity
-export async function GET(
-  _request: Request,
+export const dynamic = "force-dynamic";
+
+/**
+ * Maximum drift between server time and caller-supplied `?now=`.
+ * Larger drifts are rejected (HTTP 400) to prevent reputation
+ * laundering: a malicious caller can't pin `now=2099-01-01` to keep a
+ * stale cohort of jobs fresh.
+ */
+const NOW_DRIFT_LIMIT_SECONDS = 24 * 60 * 60;
+
+const querySchema = z.object({
+  /**
+   * Optional ISO timestamp the caller wants the score evaluated at.
+   * Useful for deterministic replays (cache keys, audits). If absent,
+   * the route falls back to `Date.now()` server-side.  Must be within
+   * ±24h of server time.
+   */
+  now: z
+    .string()
+    .datetime({ offset: true })
+    .optional(),
+  /**
+   * Optional cap on how many recent jobs to load.
+   * Defaults to 5_000 which is enough for cold-start + healthy-provider
+   * scenarios and bounded to avoid runaway queries.
+   */
+  jobLimit: z.coerce.number().int().positive().max(10_000).optional(),
+});
+
+
+/**
+ * GET /api/talos/:id/reputation
+ *
+ * Returns a versioned reputation score for a provider TALOS with:
+ *  - explicit input sub-signals (auditable / reproducible)
+ *  - confidence in [0,1] tied to evidence quality
+ *  - bounded sybil influence via counterparty-concentration damping
+ *  - decay (older jobs weight less)
+ *
+ * Public read — same posture as `/api/talos/:id/credit-score`.  A future
+ * roadmap item may tighten this to Patron-only readers; until then, the
+ * endpoint exposes no PII (only TALOS ids, counts, and shares).
+ */
+async function _GET(
+  request: NextRequest,
   { params }: { params: Promise<{ id: string }> },
 ) {
   const { id } = await params;
 
   try {
-    const talos = await db
-      .select({
-        id: tlsTalos.id,
-        name: tlsTalos.name,
-        category: tlsTalos.category,
-        status: tlsTalos.status,
-        createdAt: tlsTalos.createdAt,
-      })
+    const parseResult = querySchema.safeParse(parseQuery(request));
+    if (!parseResult.success) {
+      return Response.json(
+        {
+          error: "Invalid query parameters",
+          issues: parseResult.error.issues.map(
+            (i) => `${i.path.join(".")}: ${i.message}`,
+          ),
+        },
+        { status: 400 },
+      );
+    }
+
+    const { now, jobLimit } = parseResult.data;
+    const evaluatedAt = now ? new Date(now) : new Date();
+    if (!Number.isFinite(evaluatedAt.getTime())) {
+      return Response.json(
+        { error: "`now` must be a valid ISO datetime" },
+        { status: 400 },
+      );
+    }
+
+    // Reputation-laundering guard.  Reject any caller-supplied `now`
+    // that drifts more than 24h from the server's clock so a malicious
+    // client cannot pin its evaluation to "fresh-for-100-years".
+    if (now) {
+      const driftMs = Math.abs(evaluatedAt.getTime() - Date.now());
+      if (driftMs > NOW_DRIFT_LIMIT_SECONDS * 1000) {
+        return Response.json(
+          {
+            error:
+              "`now` must be within 24h of server time to prevent " +
+              "reputation laundering",
+          },
+          { status: 400 },
+        );
+      }
+    }
+
+    // Provider existence check — 404 lets mirrors detect "agent gone" rather
+    // than mistaking an empty score for a missing provider.
+    const provider = await db
+      .select({ id: tlsTalos.id })
       .from(tlsTalos)
       .where(eq(tlsTalos.id, id))
       .limit(1)
       .then((r) => r[0] ?? null);
 
-    if (!talos) {
-      return Response.json({ error: "TALOS not found" }, { status: 404 });
+    if (!provider) {
+      return Response.json(
+        { error: "TALOS not found" },
+        { status: 404 },
+      );
     }
 
-    const now = new Date();
-    const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
-    const ninetyDaysAgo = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000);
+    // Pull the provider's recent commerce jobs, bounded by recency and
+    // a hard cap on the requested `jobLimit`.
+    const cutoff = new Date(
+      evaluatedAt.getTime() - MAX_JOB_AGE_DAYS * 24 * 60 * 60 * 1000,
+    );
+    const limit = jobLimit ?? 5_000;
 
-    // ── Revenue (public signal of economic health) ─────────────────
-    const [revenueLast30] = await db
+    const jobRows = await db
       .select({
-        total: sql<string>`coalesce(sum(${tlsRevenues.amount}), '0')`,
-        count: sql<number>`count(*)::int`,
+        id: tlsReputationInputs.jobId,
+        status: tlsReputationInputs.status,
+        requesterTalosId: tlsReputationInputs.requesterTalosId,
+        createdAt: tlsReputationInputs.jobCreatedAt,
+        updatedAt: tlsReputationInputs.jobUpdatedAt,
+        hasResult: tlsReputationInputs.hasResult,
       })
-      .from(tlsRevenues)
-      .where(
-        and(eq(tlsRevenues.talosId, id), gte(tlsRevenues.createdAt, thirtyDaysAgo)),
-      );
-
-    const [revenueLast90] = await db
-      .select({
-        total: sql<string>`coalesce(sum(${tlsRevenues.amount}), '0')`,
-        count: sql<number>`count(*)::int`,
-      })
-      .from(tlsRevenues)
-      .where(
-        and(eq(tlsRevenues.talosId, id), gte(tlsRevenues.createdAt, ninetyDaysAgo)),
-      );
-
-    // ── Activity volume ────────────────────────────────────────────
-    const [activityLast30] = await db
-      .select({ count: sql<number>`count(*)::int` })
-      .from(tlsActivities)
+      .from(tlsReputationInputs)
       .where(
         and(
-          eq(tlsActivities.talosId, id),
-          gte(tlsActivities.createdAt, thirtyDaysAgo),
+          eq(tlsReputationInputs.talosId, id),
+          sql`${tlsReputationInputs.jobCreatedAt} >= ${cutoff}`,
         ),
-      );
+      )
+      .orderBy(desc(tlsReputationInputs.jobCreatedAt))
+      .limit(limit);
 
-    // ── Job fulfilment rate (completed vs total) ───────────────────
-    const [jobStats] = await db
-      .select({
-        total: sql<number>`count(*)::int`,
-        completed: sql<number>`count(*) filter (where ${tlsCommerceJobs.status} = 'completed')::int`,
-        failed: sql<number>`count(*) filter (where ${tlsCommerceJobs.status} = 'failed')::int`,
-      })
-      .from(tlsCommerceJobs)
-      .where(eq(tlsCommerceJobs.talosId, id));
+    // Map DB rows → reputation input.
+    const jobs: ReputationJobInput[] = jobRows.map((row) => ({
+      id: row.id,
+      status: row.status ?? "unknown",
+      requesterTalosId: row.requesterTalosId,
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt,
+      hasResult: row.hasResult,
+    }));
 
-    // ── Approval track-record (decided approvals) ──────────────────
-    const [approvalStats] = await db
-      .select({
-        total: sql<number>`count(*)::int`,
-        approved: sql<number>`count(*) filter (where ${tlsApprovals.status} = 'approved')::int`,
-      })
-      .from(tlsApprovals)
-      .where(eq(tlsApprovals.talosId, id));
-
-    // ── Patron engagement ──────────────────────────────────────────
-    const [patronStats] = await db
-      .select({ count: sql<number>`count(*)::int` })
-      .from(tlsPatrons)
-      .where(and(eq(tlsPatrons.talosId, id), eq(tlsPatrons.status, "active")));
-
-    // ── Compute reputation score (0-100) ───────────────────────────
-
-    // Age factor: older agents earn trust (+10 max over 90 days)
-    const ageMs = now.getTime() - talos.createdAt.getTime();
-    const ageDays = ageMs / (1000 * 60 * 60 * 24);
-    const ageFactor = Math.min(10, (ageDays / 90) * 10);
-
-    // Revenue consistency factor (+25 max)
-    const revenueFactor =
-      revenueLast30.count > 0
-        ? Math.min(25, (revenueLast30.count / 20) * 25) // 20 tx in 30 days = full score
-        : 0;
-
-    // Job fulfilment factor (+30 max)
-    const fulfilmentRate =
-      jobStats.total > 0 ? jobStats.completed / jobStats.total : 0;
-    const jobFactor = fulfilmentRate * 30;
-
-    // Patron trust factor (+20 max)
-    const patronFactor = Math.min(20, patronStats.count * 2);
-
-    // Activity engagement factor (+15 max)
-    const activityFactor =
-      activityLast30.count > 0
-        ? Math.min(15, (activityLast30.count / 30) * 15)
-        : 0;
-
-    const rawScore =
-      ageFactor + revenueFactor + jobFactor + patronFactor + activityFactor;
-    const reputationScore = Math.round(Math.max(0, Math.min(100, rawScore)) * 100) / 100;
-
-    // Grade
-    const gradeMap: Array<[number, string]> = [
-      [90, "AAA"],
-      [80, "AA"],
-      [70, "A"],
-      [60, "BBB"],
-      [50, "BB"],
-      [40, "B"],
-      [30, "CCC"],
-    ];
-    const reputationGrade =
-      gradeMap.find(([threshold]) => reputationScore >= threshold)?.[1] ?? "D";
-
-    return Response.json({
-      talosId: talos.id,
-      talosName: talos.name,
-      category: talos.category,
-      status: talos.status,
-      generatedAt: now.toISOString(),
-
-      reputationScore,
-      reputationGrade,
-      reputationSummary:
-        reputationScore >= 80
-          ? "Highly trusted — strong track record and patron support"
-          : reputationScore >= 60
-            ? "Good standing — reliable history with room to grow"
-            : reputationScore >= 40
-              ? "Moderate reputation — limited history or mixed fulfilment"
-              : "Low reputation — build activity and complete more jobs",
-
-      signals: {
-        agedays: Math.round(ageDays),
-        revenueTransactions30d: revenueLast30.count,
-        revenueTransactions90d: revenueLast90.count,
-        totalRevenue30d: Number(revenueLast30.total),
-        activityCount30d: activityLast30.count,
-        jobsTotal: jobStats.total,
-        jobsCompleted: jobStats.completed,
-        jobsFailed: jobStats.failed,
-        jobFulfilmentRate: jobStats.total > 0
-          ? Math.round((jobStats.completed / jobStats.total) * 10000) / 100
-          : null,
-        activePatrons: patronStats.count,
-        approvalRate: approvalStats.total > 0
-          ? Math.round((approvalStats.approved / approvalStats.total) * 10000) / 100
-          : null,
-      },
-
-      factors: {
-        age: Math.round(ageFactor * 100) / 100,
-        revenueConsistency: Math.round(revenueFactor * 100) / 100,
-        jobFulfilment: Math.round(jobFactor * 100) / 100,
-        patronTrust: Math.round(patronFactor * 100) / 100,
-        activityEngagement: Math.round(activityFactor * 100) / 100,
-      },
+    // Validate before passing to the pure scoring module.  This guards
+    // against future DB schema drift silently breaking the math.
+    const inputs = reputationInputsSchema.parse({
+      providerId: provider.id,
+      jobs,
     });
+
+    const score = computeReputation(inputs, { now: evaluatedAt });
+
+    // Single source of truth for `scoreVersion`: the lib exports the
+    // constant and `computeReputation` echoes it back on the result.
+    // We deliberately don't pin a second literal in this file, so an
+    // unintended bump in either place fails fast at typecheck / test
+    // time instead of silently drifting.
+    //
+    // When the caller pinned `now`, mark the response as no-store so
+    // edge caches don't pin a custom-`now` result globally.
+    const cacheControl = now
+      ? "no-store"
+      : "public, max-age=60, stale-while-revalidate=300";
+
+    return Response.json(
+      {
+        ...score,
+        // Top-level `scoreVersion` is already in `score`; we omit the
+        // duplicate rather than silently overriding it.
+        requestedNow: now ?? null,
+        requestedJobLimit: limit,
+        windowDays: MAX_JOB_AGE_DAYS,
+      },
+      {
+        headers: {
+          "Cache-Control": cacheControl,
+          "X-Reputation-Version": REPUTATION_SCORE_VERSION,
+        },
+      },
+    );
   } catch (err) {
+    if (err instanceof z.ZodError) {
+      return Response.json(
+        {
+          error: "Invalid reputation inputs",
+          issues: err.issues.map(
+            (i) => `${i.path.join(".")}: ${i.message}`,
+          ),
+        },
+        { status: 400 },
+      );
+    }
     console.error("[reputation GET]", err);
-    return Response.json({ error: "Internal server error" }, { status: 500 });
+    return Response.json(
+      { error: "Internal server error" },
+      { status: 500 },
+    );
   }
 }
+
+function parseQuery(request: NextRequest): Record<string, string> {
+  const { searchParams } = new URL(request.url);
+  const out: Record<string, string> = {};
+  for (const [k, v] of searchParams.entries()) {
+    out[k] = v;
+  }
+  return out;
+}
+
+export const GET = withRequestId(_GET);
