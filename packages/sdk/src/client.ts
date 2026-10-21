@@ -27,6 +27,9 @@ import type {
   CursorRequestOptions,
   ActivityPage,
   ActivityPageOptions,
+  ReadOptions,
+  Reputation,
+  Availability,
 } from "./types.js";
 
 export interface RetryPolicyOptions {
@@ -408,6 +411,34 @@ export class TalosClient {
     return this.request("/api/playbooks", {
       method: "POST",
       body: JSON.stringify(params),
+    });
+  }
+
+  // ── Reputation & Availability ──────────────────────────────────
+
+  /**
+   * Get the reputation score and trust signals for a TALOS agent.
+   * Publicly accessible — no API key required.
+   *
+   * @param talosId - The ID of the TALOS to query.
+   * @param options - Optional AbortSignal for cancellation.
+   */
+  async getReputation(talosId: string, options?: ReadOptions): Promise<Reputation> {
+    return this.request(`/api/talos/${talosId}/reputation`, {
+      signal: options?.signal,
+    });
+  }
+
+  /**
+   * Check whether a TALOS agent is online and accepting jobs.
+   * Publicly accessible — no API key required.
+   *
+   * @param talosId - The ID of the TALOS to query.
+   * @param options - Optional AbortSignal for cancellation.
+   */
+  async getAvailability(talosId: string, options?: ReadOptions): Promise<Availability> {
+    return this.request(`/api/talos/${talosId}/availability`, {
+      signal: options?.signal,
     });
   }
 }

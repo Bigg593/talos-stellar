@@ -652,4 +652,204 @@ it("should fetch one activity page with typed cursor response", async () => {
       );
     });
   });
+
+  // ── getReputation ──────────────────────────────────────────────
+
+  describe("getReputation", () => {
+    const mockReputation = {
+      talosId: "talos-1",
+      talosName: "Vega",
+      category: "Analytics",
+      status: "Active",
+      generatedAt: "2026-10-21T06:00:00.000Z",
+      reputationScore: 72.5,
+      reputationGrade: "A",
+      reputationSummary: "Good standing — reliable history with room to grow",
+      signals: {
+        agedays: 45,
+        revenueTransactions30d: 18,
+        revenueTransactions90d: 42,
+        totalRevenue30d: 900,
+        activityCount30d: 25,
+        jobsTotal: 10,
+        jobsCompleted: 9,
+        jobsFailed: 1,
+        jobFulfilmentRate: 90,
+        activePatrons: 4,
+        approvalRate: 80,
+      },
+      factors: {
+        age: 5,
+        revenueConsistency: 22.5,
+        jobFulfilment: 27,
+        patronTrust: 8,
+        activityEngagement: 10,
+      },
+    };
+
+    it("should return reputation on success", async () => {
+      vi.mocked(fetch).mockResolvedValueOnce({
+        ok: true,
+        json: async () => mockReputation,
+      } as Response);
+
+      const result = await client.getReputation("talos-1");
+
+      expect(fetch).toHaveBeenCalledWith(
+        "http://localhost:3000/api/talos/talos-1/reputation",
+        expect.objectContaining({
+          headers: expect.objectContaining({ Authorization: "Bearer test-key" }),
+        }),
+      );
+      expect(result).toEqual(mockReputation);
+      expect(result.reputationScore).toBe(72.5);
+      expect(result.reputationGrade).toBe("A");
+    });
+
+    it("should throw TalosAPIError on 401", async () => {
+      vi.mocked(fetch).mockResolvedValueOnce({
+        ok: false,
+        status: 401,
+        text: async () => "Unauthorized",
+      } as Response);
+
+      await expect(client.getReputation("talos-1")).rejects.toThrow(TalosAPIError);
+      await expect(client.getReputation("talos-1")).rejects.toMatchObject({ status: 401 });
+    });
+
+    it("should throw TalosAPIError on 404 for unknown talos", async () => {
+      vi.mocked(fetch).mockResolvedValueOnce({
+        ok: false,
+        status: 404,
+        text: async () => '{"error":"TALOS not found"}',
+      } as Response);
+
+      await expect(client.getReputation("unknown-id")).rejects.toThrow(TalosAPIError);
+      await expect(client.getReputation("unknown-id")).rejects.toMatchObject({ status: 404 });
+    });
+
+    it("should forward abort signal", async () => {
+      const controller = new AbortController();
+      vi.mocked(fetch).mockRejectedValueOnce(new DOMException("Aborted", "AbortError"));
+
+      await expect(
+        client.getReputation("talos-1", { signal: controller.signal }),
+      ).rejects.toThrow("Aborted");
+      expect(fetch).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ signal: controller.signal }),
+      );
+    });
+  });
+
+  // ── getAvailability ────────────────────────────────────────────
+
+  describe("getAvailability", () => {
+    const mockAvailability = {
+      talosId: "talos-1",
+      talosName: "Vega",
+      status: "Active",
+      checkedAt: "2026-10-21T06:00:00.000Z",
+      availability: {
+        status: "online",
+        agentOnline: true,
+        agentLastSeen: "2026-10-21T05:58:00.000Z",
+        lastSeenMinutesAgo: 2,
+        recentActivityCount1h: 5,
+        recentActivityCount24h: 18,
+        acceptingJobs: true,
+      },
+      service: {
+        id: "svc-1",
+        serviceName: "Market Analysis",
+        description: "Real-time USDC market analytics",
+        price: 0.5,
+        currency: "USDC",
+        fulfillmentMode: "async",
+        listedAt: "2026-10-20T12:00:00.000Z",
+      },
+    };
+
+    it("should return availability on success", async () => {
+      vi.mocked(fetch).mockResolvedValueOnce({
+        ok: true,
+        json: async () => mockAvailability,
+      } as Response);
+
+      const result = await client.getAvailability("talos-1");
+
+      expect(fetch).toHaveBeenCalledWith(
+        "http://localhost:3000/api/talos/talos-1/availability",
+        expect.objectContaining({
+          headers: expect.objectContaining({ Authorization: "Bearer test-key" }),
+        }),
+      );
+      expect(result).toEqual(mockAvailability);
+      expect(result.availability.status).toBe("online");
+      expect(result.availability.acceptingJobs).toBe(true);
+    });
+
+    it("should return offline status when agent is not available", async () => {
+      const offlineMock = {
+        ...mockAvailability,
+        availability: {
+          ...mockAvailability.availability,
+          status: "offline",
+          agentOnline: false,
+          agentLastSeen: null,
+          lastSeenMinutesAgo: null,
+          recentActivityCount1h: 0,
+          recentActivityCount24h: 0,
+          acceptingJobs: false,
+        },
+        service: null,
+      };
+
+      vi.mocked(fetch).mockResolvedValueOnce({
+        ok: true,
+        json: async () => offlineMock,
+      } as Response);
+
+      const result = await client.getAvailability("talos-1");
+
+      expect(result.availability.status).toBe("offline");
+      expect(result.availability.acceptingJobs).toBe(false);
+      expect(result.service).toBeNull();
+    });
+
+    it("should throw TalosAPIError on 401", async () => {
+      vi.mocked(fetch).mockResolvedValueOnce({
+        ok: false,
+        status: 401,
+        text: async () => "Unauthorized",
+      } as Response);
+
+      await expect(client.getAvailability("talos-1")).rejects.toThrow(TalosAPIError);
+      await expect(client.getAvailability("talos-1")).rejects.toMatchObject({ status: 401 });
+    });
+
+    it("should throw TalosAPIError on 404 for unknown talos", async () => {
+      vi.mocked(fetch).mockResolvedValueOnce({
+        ok: false,
+        status: 404,
+        text: async () => '{"error":"TALOS not found"}',
+      } as Response);
+
+      await expect(client.getAvailability("unknown-id")).rejects.toThrow(TalosAPIError);
+      await expect(client.getAvailability("unknown-id")).rejects.toMatchObject({ status: 404 });
+    });
+
+    it("should forward abort signal", async () => {
+      const controller = new AbortController();
+      vi.mocked(fetch).mockRejectedValueOnce(new DOMException("Aborted", "AbortError"));
+
+      await expect(
+        client.getAvailability("talos-1", { signal: controller.signal }),
+      ).rejects.toThrow("Aborted");
+      expect(fetch).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ signal: controller.signal }),
+      );
+    });
+  });
 });

@@ -323,3 +323,73 @@ export interface TransferResponse {
   amount: number;
   txHash: string;
 }
+
+// ── Reputation & Availability types ──────────────────────────────
+
+export interface ReadOptions {
+  signal?: AbortSignal;
+}
+
+export interface ReputationSignals {
+  agedays: number;
+  revenueTransactions30d: number;
+  revenueTransactions90d: number;
+  totalRevenue30d: number;
+  activityCount30d: number;
+  jobsTotal: number;
+  jobsCompleted: number;
+  jobsFailed: number;
+  jobFulfilmentRate: number | null;
+  activePatrons: number;
+  approvalRate: number | null;
+}
+
+export interface ReputationFactors {
+  age: number;
+  revenueConsistency: number;
+  jobFulfilment: number;
+  patronTrust: number;
+  activityEngagement: number;
+}
+
+export interface Reputation {
+  talosId: string;
+  talosName: string;
+  category: string;
+  status: string;
+  generatedAt: string;
+  reputationScore: number;
+  reputationGrade: string;
+  reputationSummary: string;
+  signals: ReputationSignals;
+  factors: ReputationFactors;
+}
+
+export interface AvailabilityStatus {
+  status: "online" | "idle" | "offline";
+  agentOnline: boolean;
+  agentLastSeen: string | null;
+  lastSeenMinutesAgo: number | null;
+  recentActivityCount1h: number;
+  recentActivityCount24h: number;
+  acceptingJobs: boolean;
+}
+
+export interface AvailabilityService {
+  id: string;
+  serviceName: string;
+  description: string | null;
+  price: number;
+  currency: string;
+  fulfillmentMode: string;
+  listedAt: string;
+}
+
+export interface Availability {
+  talosId: string;
+  talosName: string;
+  status: string;
+  checkedAt: string;
+  availability: AvailabilityStatus;
+  service: AvailabilityService | null;
+}
