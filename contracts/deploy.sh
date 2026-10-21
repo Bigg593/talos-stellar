@@ -20,80 +20,44 @@
 
 set -euo pipefail
 
-NETWORK="${1:-testnet}"
-SOURCE="deployer"      # default key name in stellar keys store
-SKIP_CONFIRM=false
+usage() {
+  echo "Usage: $0 [testnet|mainnet] [--source <key-name>]" >&2
+}
 
-# ── Parse flags ───────────────────────────────────────────────────────────────
-shift || true
+NETWORK="testnet"
+SOURCE="deployer"  # default key name in stellar keys store
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --source)
+      if [[ $# -lt 2 ]]; then
+        echo "✗  --source requires a value" >&2
+        usage
+        exit 1
+      fi
       SOURCE="$2"
       shift 2
       ;;
-    --yes|-y)
-      SKIP_CONFIRM=true
+    testnet|mainnet)
+      NETWORK="$1"
       shift
       ;;
     *)
-      echo "Unknown option: $1"
-      echo "Usage: ./deploy.sh [testnet|mainnet] [--source <key-name>] [--yes]"
+      echo "✗  Unknown argument: $1" >&2
+      usage
       exit 1
       ;;
   esac
 done
 
-# ── Mainnet guard ─────────────────────────────────────────────────────────────
-if [[ "$NETWORK" == "mainnet" ]] && [[ "$SKIP_CONFIRM" == "false" ]]; then
-  echo ""
-  echo "⚠️  You are about to deploy to MAINNET."
-  echo "   This will consume real XLM and cannot be undone."
-  echo ""
-  read -r -p "Type 'yes' to confirm mainnet deployment: " CONFIRM
-  if [[ "$CONFIRM" != "yes" ]]; then
-    echo "Aborted."
-    exit 1
-  fi
+# DRY_RUN=1 prints the resolved network/source and exits, without building
+# or touching the network. Used by scripts/deploy.test.sh.
+if [[ "${DRY_RUN:-0}" == "1" ]]; then
+  echo "NETWORK=$NETWORK"
+  echo "SOURCE=$SOURCE"
+  exit 0
 fi
 
-# ── Idempotency helpers ───────────────────────────────────────────────────────
-ID_DIR=".deploy-ids/${NETWORK}"
-mkdir -p "$ID_DIR"
-
-load_or_deploy() {
-  local name="$1"
-  local wasm="$2"
-  local id_file="${ID_DIR}/${name}_id"
-
-  if [[ -f "$id_file" ]]; then
-    local existing_id
-    existing_id=$(cat "$id_file")
-    echo "   ↩  ${name} already deployed: ${existing_id} (skipping re-deploy)" >&2
-    echo "$existing_id"
-    return
-  fi
-
-  local contract_id
-  contract_id=$(stellar contract deploy \
-    --wasm "$wasm" \
-    --network "$NETWORK" \
-    --source "$SOURCE")
-
-  echo "$contract_id" > "$id_file"
-  echo "$contract_id"
-}
-
-is_initialized() {
-  local id_file="${ID_DIR}/${1}_initialized"
-  [[ -f "$id_file" ]]
-}
-
-mark_initialized() {
-  touch "${ID_DIR}/${1}_initialized"
-}
-
-# ── Build ─────────────────────────────────────────────────────────────────────
 echo "▶  Building Soroban contracts (release)..."
 cargo build --target wasm32-unknown-unknown --release 2>&1 | tail -5
 
