@@ -323,3 +323,197 @@ export interface TransferResponse {
   amount: number;
   txHash: string;
 }
+
+// ── Financial Insight types ──────────────────────────────────────
+
+export interface ReadOptions {
+  signal?: AbortSignal;
+}
+
+export interface CreditScoreIncome {
+  weeklyRevenue: number;
+  monthlyRevenue: number;
+  quarterlyRevenue: number;
+  netWeeklyIncome: number;
+  annualizedWeeklyIncome: number;
+  revenueTransactionCount: {
+    weekly: number;
+    monthly: number;
+    quarterly: number;
+  };
+}
+
+export interface CreditScoreDebt {
+  weeklyApprovedSpending: number;
+  monthlyApprovedSpending: number;
+  quarterlyApprovedSpending: number;
+  avgMonthlySpending: number;
+  spendingTransactionCount: {
+    weekly: number;
+    monthly: number;
+    quarterly: number;
+  };
+}
+
+export interface CreditScoreRatios {
+  debtToRevenue7d: number;
+  debtToRevenue30d: number;
+  debtToRevenue90d: number;
+}
+
+export interface CreditScoreBorrowingCapacity {
+  sustainableBorrowingLimit: number;
+  currentMonthlySpending: number;
+  borrowingUtilization: number;
+  borrowingStatusMessage: string;
+}
+
+export interface CreditScorePatronEngagement {
+  activePatrons: number;
+  totalPatronHoldings: number;
+}
+
+export interface CreditScore {
+  talosId: string;
+  talosName: string;
+  generatedAt: string;
+  creditScore: number;
+  creditGrade: string;
+  creditSummary: string;
+  income: CreditScoreIncome;
+  debt: CreditScoreDebt;
+  ratios: CreditScoreRatios;
+  borrowingCapacity: CreditScoreBorrowingCapacity;
+  patronEngagement: CreditScorePatronEngagement;
+  riskFactors: (string | false)[];
+  recommendations: (string | false)[];
+}
+
+export interface FinancialSummaryRevenueSource {
+  source: string;
+  total: number;
+  count: number;
+}
+
+export interface FinancialSummarySpendingType {
+  type: string;
+  total: number;
+  count: number;
+}
+
+export interface FinancialSummaryCashFlow {
+  totalRevenue: number;
+  totalSpending: number;
+  netProfit: number;
+  profitMargin: number;
+  revenueTransactionCount: number;
+  spendingTransactionCount: number;
+  revenueBySource: FinancialSummaryRevenueSource[];
+  spendingByType: FinancialSummarySpendingType[];
+}
+
+export interface FinancialSummaryMonthlyRevenue {
+  month: string;
+  revenue: number;
+  transactionCount: number;
+}
+
+export interface FinancialSummaryTrends {
+  revenueLast30Days: number;
+  revenuePrevious30Days: number;
+  revenueGrowthRate: number;
+  spendingLast30Days: number;
+  netProfitLast30Days: number;
+  annualizedRunRate: number;
+  monthlyRevenue: FinancialSummaryMonthlyRevenue[];
+}
+
+export interface FinancialSummaryBudget {
+  gtmBudget: number;
+  totalApprovedSpending: number;
+  budgetUtilization: number;
+  budgetRemaining: number;
+}
+
+export interface FinancialSummarySpendingHistoryItem {
+  id: string;
+  type: string;
+  title: string;
+  description?: string | null;
+  amount: number;
+  decidedAt: string | null;
+  txHash: string | null;
+  createdAt: string;
+}
+
+export interface FinancialSummaryPlaybookItem {
+  id: string;
+  title: string;
+  price: number;
+  currency: string;
+  category: string;
+  status: string;
+  purchaseCount: number;
+  salesRevenue: number;
+}
+
+export interface FinancialSummaryPlaybookSales {
+  totalPlaybooks: number;
+  totalSales: number;
+  totalRevenue: number;
+  playbooks: FinancialSummaryPlaybookItem[];
+}
+
+export interface FinancialSummary {
+  talosId: string;
+  talosName: string;
+  category: string;
+  status: string;
+  generatedAt: string;
+  cashFlow: FinancialSummaryCashFlow;
+  trends: FinancialSummaryTrends;
+  budget: FinancialSummaryBudget;
+  spendingHistory: FinancialSummarySpendingHistoryItem[];
+  playbookSales: FinancialSummaryPlaybookSales;
+}
+
+export interface FinancialProjectionExpectedRevenue {
+  monthly: number[];
+  quarterly: number[];
+  yearly: number;
+}
+
+export interface FinancialProjectionBudgetSuggestion {
+  category: string;
+  amount: number;
+  rationale: string;
+}
+
+export interface FinancialProjectionRoiEstimations {
+  shortTerm: number;
+  mediumTerm: number;
+  longTerm: number;
+  confidence: "low" | "medium" | "high";
+}
+
+export interface FinancialProjectionData {
+  expectedRevenue: FinancialProjectionExpectedRevenue;
+  budgetSuggestions: FinancialProjectionBudgetSuggestion[];
+  roiEstimations: FinancialProjectionRoiEstimations;
+  insights: string[];
+}
+
+export interface FinancialProjectionMetadata {
+  talosId: string;
+  generatedAt: string;
+  dataPoints: {
+    revenues: number;
+    activities: number;
+    patrons: number;
+  };
+}
+
+export interface FinancialProjection {
+  projection: FinancialProjectionData;
+  metadata: FinancialProjectionMetadata;
+}

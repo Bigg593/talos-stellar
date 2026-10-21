@@ -653,3 +653,264 @@ it("should fetch one activity page with typed cursor response", async () => {
     });
   });
 });
+
+describe("Financial Insight Methods", () => {
+  const client = new TalosClient({ baseUrl: "http://localhost:3000", apiKey: "test-key" });
+
+  beforeEach(() => {
+    vi.stubGlobal("fetch", vi.fn());
+  });
+
+  // ── getCreditScore ─────────────────────────────────────────────
+
+  describe("getCreditScore", () => {
+    const mockCreditScore = {
+      talosId: "talos-1",
+      talosName: "Vega",
+      generatedAt: "2026-10-21T05:00:00.000Z",
+      creditScore: 78.5,
+      creditGrade: "B",
+      creditSummary: "B rating — Excellent borrowing capacity",
+      income: {
+        weeklyRevenue: 250,
+        monthlyRevenue: 1000,
+        quarterlyRevenue: 3000,
+        netWeeklyIncome: 200,
+        annualizedWeeklyIncome: 10400,
+        revenueTransactionCount: { weekly: 5, monthly: 20, quarterly: 60 },
+      },
+      debt: {
+        weeklyApprovedSpending: 50,
+        monthlyApprovedSpending: 200,
+        quarterlyApprovedSpending: 600,
+        avgMonthlySpending: 200,
+        spendingTransactionCount: { weekly: 1, monthly: 4, quarterly: 12 },
+      },
+      ratios: { debtToRevenue7d: 20, debtToRevenue30d: 20, debtToRevenue90d: 20 },
+      borrowingCapacity: {
+        sustainableBorrowingLimit: 600,
+        currentMonthlySpending: 200,
+        borrowingUtilization: 33.33,
+        borrowingStatusMessage: "✓ Healthy borrowing level",
+      },
+      patronEngagement: { activePatrons: 5, totalPatronHoldings: 50000 },
+      riskFactors: [],
+      recommendations: [],
+    };
+
+    it("should return credit score on success", async () => {
+      vi.mocked(fetch).mockResolvedValueOnce({
+        ok: true,
+        json: async () => mockCreditScore,
+      } as Response);
+
+      const result = await client.getCreditScore("talos-1");
+
+      expect(fetch).toHaveBeenCalledWith(
+        "http://localhost:3000/api/talos/talos-1/credit-score",
+        expect.objectContaining({ headers: expect.objectContaining({ Authorization: "Bearer test-key" }) }),
+      );
+      expect(result).toEqual(mockCreditScore);
+    });
+
+    it("should throw TalosAPIError on 401", async () => {
+      vi.mocked(fetch).mockResolvedValueOnce({
+        ok: false,
+        status: 401,
+        text: async () => "Unauthorized",
+      } as Response);
+
+      await expect(client.getCreditScore("talos-1")).rejects.toThrow(TalosAPIError);
+      await expect(client.getCreditScore("talos-1")).rejects.toMatchObject({ status: 401 });
+    });
+
+    it("should throw TalosAPIError on 404 for unknown talos", async () => {
+      vi.mocked(fetch).mockResolvedValueOnce({
+        ok: false,
+        status: 404,
+        text: async () => '{"error":"TALOS not found"}',
+      } as Response);
+
+      await expect(client.getCreditScore("unknown-id")).rejects.toThrow(TalosAPIError);
+      await expect(client.getCreditScore("unknown-id")).rejects.toMatchObject({ status: 404 });
+    });
+
+    it("should forward abort signal", async () => {
+      const controller = new AbortController();
+      vi.mocked(fetch).mockRejectedValueOnce(new DOMException("Aborted", "AbortError"));
+
+      await expect(client.getCreditScore("talos-1", { signal: controller.signal })).rejects.toThrow("Aborted");
+      expect(fetch).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ signal: controller.signal }),
+      );
+    });
+  });
+
+  // ── getFinancialSummary ────────────────────────────────────────
+
+  describe("getFinancialSummary", () => {
+    const mockSummary = {
+      talosId: "talos-1",
+      talosName: "Vega",
+      category: "Analytics",
+      status: "Active",
+      generatedAt: "2026-10-21T05:00:00.000Z",
+      cashFlow: {
+        totalRevenue: 5000,
+        totalSpending: 1200,
+        netProfit: 3800,
+        profitMargin: 76,
+        revenueTransactionCount: 50,
+        spendingTransactionCount: 12,
+        revenueBySource: [{ source: "commerce", total: 5000, count: 50 }],
+        spendingByType: [{ type: "transaction", total: 1200, count: 12 }],
+      },
+      trends: {
+        revenueLast30Days: 1000,
+        revenuePrevious30Days: 800,
+        revenueGrowthRate: 25,
+        spendingLast30Days: 300,
+        netProfitLast30Days: 700,
+        annualizedRunRate: 12000,
+        monthlyRevenue: [{ month: "2026-10", revenue: 1000, transactionCount: 10 }],
+      },
+      budget: {
+        gtmBudget: 5000,
+        totalApprovedSpending: 1200,
+        budgetUtilization: 24,
+        budgetRemaining: 3800,
+      },
+      spendingHistory: [],
+      playbookSales: { totalPlaybooks: 2, totalSales: 5, totalRevenue: 50, playbooks: [] },
+    };
+
+    it("should return financial summary on success", async () => {
+      vi.mocked(fetch).mockResolvedValueOnce({
+        ok: true,
+        json: async () => mockSummary,
+      } as Response);
+
+      const result = await client.getFinancialSummary("talos-1");
+
+      expect(fetch).toHaveBeenCalledWith(
+        "http://localhost:3000/api/talos/talos-1/financial-summary",
+        expect.objectContaining({ headers: expect.objectContaining({ Authorization: "Bearer test-key" }) }),
+      );
+      expect(result).toEqual(mockSummary);
+    });
+
+    it("should throw TalosAPIError on 401", async () => {
+      vi.mocked(fetch).mockResolvedValueOnce({
+        ok: false,
+        status: 401,
+        text: async () => "Unauthorized",
+      } as Response);
+
+      await expect(client.getFinancialSummary("talos-1")).rejects.toThrow(TalosAPIError);
+      await expect(client.getFinancialSummary("talos-1")).rejects.toMatchObject({ status: 401 });
+    });
+
+    it("should throw TalosAPIError on 404 for unknown talos", async () => {
+      vi.mocked(fetch).mockResolvedValueOnce({
+        ok: false,
+        status: 404,
+        text: async () => '{"error":"TALOS not found"}',
+      } as Response);
+
+      await expect(client.getFinancialSummary("unknown-id")).rejects.toThrow(TalosAPIError);
+      await expect(client.getFinancialSummary("unknown-id")).rejects.toMatchObject({ status: 404 });
+    });
+
+    it("should forward abort signal", async () => {
+      const controller = new AbortController();
+      vi.mocked(fetch).mockRejectedValueOnce(new DOMException("Aborted", "AbortError"));
+
+      await expect(client.getFinancialSummary("talos-1", { signal: controller.signal })).rejects.toThrow("Aborted");
+      expect(fetch).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ signal: controller.signal }),
+      );
+    });
+  });
+
+  // ── getFinancialProjection ─────────────────────────────────────
+
+  describe("getFinancialProjection", () => {
+    const mockProjection = {
+      projection: {
+        expectedRevenue: {
+          monthly: [1100, 1200, 1300, 1400, 1500, 1600],
+          quarterly: [3600, 4200, 4500],
+          yearly: 15600,
+        },
+        budgetSuggestions: [
+          { category: "Marketing", amount: 400, rationale: "Expand reach" },
+        ],
+        roiEstimations: {
+          shortTerm: 10,
+          mediumTerm: 25,
+          longTerm: 50,
+          confidence: "medium" as const,
+        },
+        insights: ["Strong revenue growth trajectory"],
+      },
+      metadata: {
+        talosId: "talos-1",
+        generatedAt: "2026-10-21T05:00:00.000Z",
+        dataPoints: { revenues: 50, activities: 30, patrons: 5 },
+      },
+    };
+
+    it("should return financial projection on success", async () => {
+      vi.mocked(fetch).mockResolvedValueOnce({
+        ok: true,
+        json: async () => mockProjection,
+      } as Response);
+
+      const result = await client.getFinancialProjection("talos-1");
+
+      expect(fetch).toHaveBeenCalledWith(
+        "http://localhost:3000/api/talos/talos-1/financial-projection",
+        expect.objectContaining({ headers: expect.objectContaining({ Authorization: "Bearer test-key" }) }),
+      );
+      expect(result).toEqual(mockProjection);
+      expect(result.projection.roiEstimations.confidence).toBe("medium");
+    });
+
+    it("should throw TalosAPIError on 401", async () => {
+      vi.mocked(fetch).mockResolvedValueOnce({
+        ok: false,
+        status: 401,
+        text: async () => "Unauthorized",
+      } as Response);
+
+      await expect(client.getFinancialProjection("talos-1")).rejects.toThrow(TalosAPIError);
+      await expect(client.getFinancialProjection("talos-1")).rejects.toMatchObject({ status: 401 });
+    });
+
+    it("should throw TalosAPIError on 404 for unknown talos", async () => {
+      vi.mocked(fetch).mockResolvedValueOnce({
+        ok: false,
+        status: 404,
+        text: async () => '{"error":"TALOS not found"}',
+      } as Response);
+
+      await expect(client.getFinancialProjection("unknown-id")).rejects.toThrow(TalosAPIError);
+      await expect(client.getFinancialProjection("unknown-id")).rejects.toMatchObject({ status: 404 });
+    });
+
+    it("should forward abort signal", async () => {
+      const controller = new AbortController();
+      vi.mocked(fetch).mockRejectedValueOnce(new DOMException("Aborted", "AbortError"));
+
+      await expect(
+        client.getFinancialProjection("talos-1", { signal: controller.signal }),
+      ).rejects.toThrow("Aborted");
+      expect(fetch).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ signal: controller.signal }),
+      );
+    });
+  });
+});

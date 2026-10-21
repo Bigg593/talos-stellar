@@ -27,6 +27,10 @@ import type {
   CursorRequestOptions,
   ActivityPage,
   ActivityPageOptions,
+  ReadOptions,
+  CreditScore,
+  FinancialSummary,
+  FinancialProjection,
 } from "./types.js";
 
 export interface RetryPolicyOptions {
@@ -408,6 +412,47 @@ export class TalosClient {
     return this.request("/api/playbooks", {
       method: "POST",
       body: JSON.stringify(params),
+    });
+  }
+
+  // ── Financial Insights ─────────────────────────────────────────
+
+  /**
+   * Get credit score and financial health metrics for a TALOS agent.
+   * Does not require authentication — publicly available read endpoint.
+   *
+   * @param talosId - The ID of the TALOS to score.
+   * @param options - Optional AbortSignal for cancellation.
+   */
+  async getCreditScore(talosId: string, options?: ReadOptions): Promise<CreditScore> {
+    return this.request(`/api/talos/${talosId}/credit-score`, {
+      signal: options?.signal,
+    });
+  }
+
+  /**
+   * Get aggregated financial analytics (revenue, spending, playbook sales) for a TALOS agent.
+   * Requires the API key of the target TALOS.
+   *
+   * @param talosId - The ID of the TALOS.
+   * @param options - Optional AbortSignal for cancellation.
+   */
+  async getFinancialSummary(talosId: string, options?: ReadOptions): Promise<FinancialSummary> {
+    return this.request(`/api/talos/${talosId}/financial-summary`, {
+      signal: options?.signal,
+    });
+  }
+
+  /**
+   * Get AI-driven financial projections for a TALOS agent.
+   * Requires the API key of the target TALOS.
+   *
+   * @param talosId - The ID of the TALOS.
+   * @param options - Optional AbortSignal for cancellation.
+   */
+  async getFinancialProjection(talosId: string, options?: ReadOptions): Promise<FinancialProjection> {
+    return this.request(`/api/talos/${talosId}/financial-projection`, {
+      signal: options?.signal,
     });
   }
 }
