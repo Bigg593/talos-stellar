@@ -65,7 +65,15 @@ export interface DiscoverServicesParams {
   self?: string;
   cursor?: string;
   limit?: number;
+  sort?: "createdAt" | "price";
+  direction?: "asc" | "desc";
   signal?: AbortSignal;
+  /**
+   * Per-request timeout in milliseconds. Overrides the client-level
+   * `timeoutMs` for this single call. `0` disables the timeout for this call
+   * regardless of the client default. Surfaces as `TalosTimeoutError`.
+   */
+  timeoutMs?: number;
 }
 
 export interface PurchaseServiceParams {
@@ -80,6 +88,12 @@ export interface CursorPageParams {
 
 export interface CursorRequestOptions extends CursorPageParams {
   signal?: AbortSignal;
+  /**
+   * Per-request timeout in milliseconds. Overrides the client-level
+   * `timeoutMs` for this single call. `0` disables the timeout for this call
+   * regardless of the client default. Surfaces as `TalosTimeoutError`.
+   */
+  timeoutMs?: number;
 }
 
 export interface ActivityPageOptions extends CursorRequestOptions {
@@ -249,6 +263,40 @@ export interface CommerceJob {
   updatedAt: string;
 }
 
+export type PaymentFinalityStatus =
+  | "PENDING"
+  | "CONFIRMING"
+  | "CONFIRMED"
+  | "FAILED"
+  | "EXPIRED"
+  | "NOT_FOUND";
+
+export interface RegisteredJobPaymentStatus {
+  jobId: string;
+  txHash: string;
+  finalityStatus: PaymentFinalityStatus;
+  confirmedLedger: number | null;
+  lastLedgerChecked: number | null;
+  pollCount: number;
+  lastError: string | null;
+  repairApplied: boolean;
+  updatedAt: string;
+}
+
+export interface UnregisteredJobPaymentStatus {
+  jobId: string;
+  txHash: string | null;
+  finalityStatus: null;
+  registered: false;
+}
+
+export type JobPaymentStatus = RegisteredJobPaymentStatus | UnregisteredJobPaymentStatus;
+
+/** Returns whether payment finality has reached a terminal state. */
+export function isTerminalPaymentFinality(status: PaymentFinalityStatus): boolean {
+  return status === "CONFIRMED" || status === "FAILED" || status === "EXPIRED" || status === "NOT_FOUND";
+}
+
 export interface Patron {
   id: string;
   talosId: string;
@@ -324,196 +372,160 @@ export interface TransferResponse {
   txHash: string;
 }
 
-// ── Financial Insight types ──────────────────────────────────────
+// ── x402 Buyer Proof Diagnostics ─────────────────────────────────
 
-export interface ReadOptions {
-  signal?: AbortSignal;
-}
+/**
+ * Stage reached in the x402 buyer proof exchange.
+ *
+ * - `"no_challenge"`: The 402 response did not carry a valid x402 challenge.
+ * - `"challenge_parsed"`: Challenge was present and parsed successfully.
+ * - `"signing_requested"`: A sign-payment call was dispatched.
+ * - `"proof_submitted"`: The X-PAYMENT header was attached and the retry sent.
+ * - `"proof_accepted"`: The service accepted the proof (200-range response).
+ * - `"proof_rejected"`: The service rejected the proof (4xx/5xx response).
+ */
+export type X402ProofStage =
+  | "no_challenge"
+  | "challenge_parsed"
+  | "signing_requested"
+  | "proof_submitted"
+  | "proof_accepted"
+  | "proof_rejected";
 
-export interface CreditScoreIncome {
-  weeklyRevenue: number;
-  monthlyRevenue: number;
-  quarterlyRevenue: number;
-  netWeeklyIncome: number;
-  annualizedWeeklyIncome: number;
-  revenueTransactionCount: {
-    weekly: number;
-    monthly: number;
-    quarterly: number;
+/**
+ * Privacy-safe diagnostic snapshot of one x402 buyer proof exchange.
+ *
+ * All sensitive material is excluded:
+ *   - `paymentHeader` (X-PAYMENT) is never included.
+ *   - `payee` Stellar address is included as-is (public key, not a secret).
+ *   - Amounts are surfaced as finite numbers only; parse failures surface
+ *     as `NaN`.
+ *
+ * This type is returned by {@link diagnoseBuyerProof} and optionally
+ * delivered to the {@link BuyerProofDiagnosticCallback} during
+ * `purchaseServiceWithPayment`.
+ */
+export interface BuyerProofDiagnostics {
+  /** Stage reached in the proof exchange lifecycle. */
+  stage: X402ProofStage;
+  /** ISO 8601 timestamp when the diagnostic was captured. */
+  capturedAt: string;
+  /** Path being requested (query-string credential params redacted). */
+  path: string;
+  /**
+   * Parsed challenge fields — present when `stage >= "challenge_parsed"`.
+   * The `payee` field is a Stellar public key (safe to surface).
+   * `price` is the raw string from the challenge.
+   * `token` and `network` are optional auxiliary fields.
+   */
+  challenge?: {
+    payee: string;
+    price: string;
+    token?: string;
+    network?: string;
   };
+  /**
+   * Numeric amount parsed from `challenge.price`.
+   * `NaN` if the challenge price was not a valid finite number.
+   * Present only when `stage >= "challenge_parsed"`.
+   */
+  parsedAmount?: number;
+  /** Whether the payment header was successfully obtained from the signer. */
+  signingSucceeded?: boolean;
+  /**
+   * Reason string if signing failed — truncated to 200 characters to
+   * prevent large raw error messages from leaking through diagnostics.
+   */
+  signingFailureReason?: string;
+  /** HTTP status code returned after submitting the proof (if submitted). */
+  proofResponseStatus?: number;
+  /** Whether the overall exchange was successful. */
+  succeeded: boolean;
+  /** Human-readable summary suitable for debug logs (no sensitive values). */
+  summary: string;
 }
 
-export interface CreditScoreDebt {
-  weeklyApprovedSpending: number;
-  monthlyApprovedSpending: number;
-  quarterlyApprovedSpending: number;
-  avgMonthlySpending: number;
-  spendingTransactionCount: {
-    weekly: number;
-    monthly: number;
-    quarterly: number;
-  };
-}
+/**
+ * Callback invoked by `purchaseServiceWithPayment` when proof diagnostics
+ * are available. Must not throw; exceptions are silently swallowed.
+ */
+export type BuyerProofDiagnosticCallback = (diag: BuyerProofDiagnostics) => void;
 
-export interface CreditScoreRatios {
-  debtToRevenue7d: number;
-  debtToRevenue30d: number;
-  debtToRevenue90d: number;
-}
+// ── Webhook subscriptions ───────────────────────────────────────────────────
+//
+// Management of outbound webhook subscriptions (create/list/delete/rotate).
+// Distinct from `webhooks.ts`, which verifies *inbound* webhook deliveries.
+// The plaintext signing secret is never returned except as the one-time
+// `secret` field on {@link RotateWebhookSecretResult} when the server
+// generates it (`generate: true`).
 
-export interface CreditScoreBorrowingCapacity {
-  sustainableBorrowingLimit: number;
-  currentMonthlySpending: number;
-  borrowingUtilization: number;
-  borrowingStatusMessage: string;
-}
-
-export interface CreditScorePatronEngagement {
-  activePatrons: number;
-  totalPatronHoldings: number;
-}
-
-export interface CreditScore {
-  talosId: string;
-  talosName: string;
-  generatedAt: string;
-  creditScore: number;
-  creditGrade: string;
-  creditSummary: string;
-  income: CreditScoreIncome;
-  debt: CreditScoreDebt;
-  ratios: CreditScoreRatios;
-  borrowingCapacity: CreditScoreBorrowingCapacity;
-  patronEngagement: CreditScorePatronEngagement;
-  riskFactors: (string | false)[];
-  recommendations: (string | false)[];
-}
-
-export interface FinancialSummaryRevenueSource {
-  source: string;
-  total: number;
-  count: number;
-}
-
-export interface FinancialSummarySpendingType {
-  type: string;
-  total: number;
-  count: number;
-}
-
-export interface FinancialSummaryCashFlow {
-  totalRevenue: number;
-  totalSpending: number;
-  netProfit: number;
-  profitMargin: number;
-  revenueTransactionCount: number;
-  spendingTransactionCount: number;
-  revenueBySource: FinancialSummaryRevenueSource[];
-  spendingByType: FinancialSummarySpendingType[];
-}
-
-export interface FinancialSummaryMonthlyRevenue {
-  month: string;
-  revenue: number;
-  transactionCount: number;
-}
-
-export interface FinancialSummaryTrends {
-  revenueLast30Days: number;
-  revenuePrevious30Days: number;
-  revenueGrowthRate: number;
-  spendingLast30Days: number;
-  netProfitLast30Days: number;
-  annualizedRunRate: number;
-  monthlyRevenue: FinancialSummaryMonthlyRevenue[];
-}
-
-export interface FinancialSummaryBudget {
-  gtmBudget: number;
-  totalApprovedSpending: number;
-  budgetUtilization: number;
-  budgetRemaining: number;
-}
-
-export interface FinancialSummarySpendingHistoryItem {
+export interface WebhookSubscription {
   id: string;
-  type: string;
-  title: string;
+  /** Present on the create response; omitted from list/detail responses. */
+  talosId?: string;
+  url: string;
+  eventTypes: string[];
   description?: string | null;
-  amount: number;
-  decidedAt: string | null;
-  txHash: string | null;
+  active: boolean;
+  signatureVersion: number;
   createdAt: string;
+  updatedAt: string;
 }
 
-export interface FinancialSummaryPlaybookItem {
+/** Subscription detail shape returned by GET/PATCH (adds rotation metadata). */
+export interface WebhookSubscriptionDetail extends WebhookSubscription {
+  secretRotatedAt?: string | null;
+  previousSecretExpiresAt?: string | null;
+  rotationActive: boolean;
+}
+
+export interface CreateWebhookSubscriptionParams {
+  url: string;
+  /** Signing secret (16–256 chars). Never echoed back by the API. */
+  secret: string;
+  eventTypes: string[];
+  description?: string;
+}
+
+export interface ListWebhookSubscriptionsParams extends CursorRequestOptions {
+  active?: boolean;
+}
+
+export type WebhookSubscriptionPage = CursorPage<WebhookSubscription>;
+
+export interface DeleteWebhookSubscriptionResult {
+  deleted: true;
   id: string;
-  title: string;
-  price: number;
-  currency: string;
-  category: string;
-  status: string;
-  purchaseCount: number;
-  salesRevenue: number;
 }
 
-export interface FinancialSummaryPlaybookSales {
-  totalPlaybooks: number;
-  totalSales: number;
-  totalRevenue: number;
-  playbooks: FinancialSummaryPlaybookItem[];
+/**
+ * Rotate the signing secret with a grace window (dual-sign, no downtime),
+ * or finalize an in-progress rotation early by passing `finalize: true`.
+ * Exactly one of `secret`, `generate`, or `finalize` must be provided.
+ */
+export interface RotateWebhookSecretParams {
+  /** Caller-supplied new secret (16–256 chars). Mutually exclusive with `generate`/`finalize`. */
+  secret?: string;
+  /** Have the server generate a random secret, returned once in the result. */
+  generate?: boolean;
+  /** Grace window (seconds) during which the previous secret remains valid. */
+  graceSeconds?: number;
+  /** Clear the previous secret early instead of rotating. */
+  finalize?: boolean;
 }
 
-export interface FinancialSummary {
-  talosId: string;
-  talosName: string;
-  category: string;
-  status: string;
-  generatedAt: string;
-  cashFlow: FinancialSummaryCashFlow;
-  trends: FinancialSummaryTrends;
-  budget: FinancialSummaryBudget;
-  spendingHistory: FinancialSummarySpendingHistoryItem[];
-  playbookSales: FinancialSummaryPlaybookSales;
+export interface RotateWebhookSecretResult {
+  id: string;
+  secretRotatedAt: string;
+  previousSecretExpiresAt: string;
+  graceSeconds: number;
+  /** Present only when `generate: true` was passed — shown once, never logged. */
+  secret?: string;
+  rotationActive: true;
 }
 
-export interface FinancialProjectionExpectedRevenue {
-  monthly: number[];
-  quarterly: number[];
-  yearly: number;
-}
-
-export interface FinancialProjectionBudgetSuggestion {
-  category: string;
-  amount: number;
-  rationale: string;
-}
-
-export interface FinancialProjectionRoiEstimations {
-  shortTerm: number;
-  mediumTerm: number;
-  longTerm: number;
-  confidence: "low" | "medium" | "high";
-}
-
-export interface FinancialProjectionData {
-  expectedRevenue: FinancialProjectionExpectedRevenue;
-  budgetSuggestions: FinancialProjectionBudgetSuggestion[];
-  roiEstimations: FinancialProjectionRoiEstimations;
-  insights: string[];
-}
-
-export interface FinancialProjectionMetadata {
-  talosId: string;
-  generatedAt: string;
-  dataPoints: {
-    revenues: number;
-    activities: number;
-    patrons: number;
-  };
-}
-
-export interface FinancialProjection {
-  projection: FinancialProjectionData;
-  metadata: FinancialProjectionMetadata;
+export interface FinalizeWebhookSecretRotationResult {
+  id: string;
+  previousSecretCleared: boolean;
+  rotationActive: false;
 }
